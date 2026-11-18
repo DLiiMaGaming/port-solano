@@ -1,440 +1,547 @@
-// PORT SOLANO — citygen.js
-// Builds the whole city from one fixed seed: a 240x240 tile grid with a
-// regular road lattice (4-tile avenues every 24 tiles), six named
-// districts, ~280 buildings, the harbour docks, the Playa beach, a bridge
-// to a small island, parks, a plaza, and every special place the game
-// needs (shops, safehouse, hospital, police station, mission spots,
-// hidden packages, race checkpoints, taxi stands, parked-car spots).
+// City generation: one deterministic build from a seed. Same seed, same city, on every
+// machine — the generator draws only from createRandom streams derived from the seed and
+// never from Math.random, and decoration that needs no stream uses hash2.
 //
-// Tile rows/columns where (t % 24) < 4 are avenues; the 20x20 tile blocks
-// between them hold the buildings. Traffic lanes ride the avenues: with
-// right-hand traffic, eastbound uses band offset 2, westbound offset 1,
-// southbound offset 1, northbound offset 2 (see lanesH / lanesV).
+// Layout (tile coordinates, world is 240x240): a mainland with a bay carved into its east
+// coast (El Puerto's docks sit on that shore), and Isla Brisa east across the water, joined
+// by a causeway bridge. Avenues run on a 16-tile grid, 3 tiles of asphalt with a sidewalk
+// tile each side; the blocks between them carry the buildings, yards and plazas.
 
-import { TILE, WORLD_TILES, T } from './config.js';
-import { RNG } from './random.js';
+import { TILE, WORLD_TILES, T, D, ROOF_PALETTES } from './config.js';
+import { createRandom, hash2 } from './random.js';
 
-const N = WORLD_TILES;
-const BAND = 24;         // avenue spacing in tiles
-const ROAD_W = 4;        // avenue width in tiles
+const W = WORLD_TILES;
+const AVENUES_X = [30, 46, 62, 78, 94, 110, 126, 142];
+const AVENUES_Y = [30, 46, 62, 78, 94, 110, 126, 142, 158, 174, 190, 206, 222];
+const ISLAND_AX = [206, 222];
+const ISLAND_AY = [114, 130, 146, 162];
+const BAY = { x: 152, y0: 88, y1: 164 };
+const ISLAND = { x0: 196, x1: 232, y0: 104, y1: 168 };
+const CAUSEWAY = { y0: 127, y1: 130 };
 
-const DISTRICT_TABLE = [
-  // by: 0        1        2        3        4        5        6        7        8        9   (bx)
-  ['old', 'old', 'old', 'down', 'down', 'down', 'down', 'ind', 'ind', 'ind'],
-  ['old', 'old', 'old', 'down', 'down', 'down', 'down', 'ind', 'ind', 'ind'],
-  ['old', 'old', 'old', 'down', 'down', 'down', 'down', 'ind', 'ind', 'ind'],
-  ['sub', 'sub', 'sub', 'down', 'down', 'down', 'down', 'ind', 'ind', 'ind'],
-  ['sub', 'sub', 'sub', 'down', 'down', 'down', 'down', 'sub', 'sub', 'sub'],
-  ['sub', 'sub', 'sub', 'down', 'down', 'down', 'down', 'sub', 'sub', 'sub'],
-  ['sub', 'sub', 'sub', 'down', 'down', 'down', 'harb', 'harb', 'harb', 'harb'],
-  ['playa', 'playa', 'playa', 'playa', 'playa', 'harb', 'harb', 'harb', 'harb', 'harb'],
-  ['playa', 'playa', 'playa', 'playa', 'playa', 'harb', 'harb', 'harb', 'harb', 'harb'],
-  ['playa', 'playa', 'playa', 'playa', 'playa', 'harb', 'harb', 'harb', 'harb', 'harb'],
-];
-export const DISTRICT_INFO = {
-  old:   { name: 'Barrio Viejo',    sub: 'Old Town' },
-  down:  { name: 'Centro',         sub: 'Downtown' },
-  ind:   { name: 'Zona Industrial', sub: 'Industrial Zone' },
-  sub:   { name: 'Las Colinas',    sub: 'Suburbs' },
-  playa: { name: 'La Playa',       sub: 'The Beach' },
-  harb:  { name: 'El Puerto',      sub: 'Harbour District' },
-};
+const NAME_A = ['Torre', 'Edificio', 'Hotel', 'Casa', 'Banco', 'Mercado', 'Palacio', 'Residencial', 'Clínica', 'Oficinas', 'Almacén', 'Teatro', 'Café', 'Bar', 'Taller', 'Farmacia', 'Escuela', 'Galería', 'Pensión', 'Mirador'];
+const NAME_B = ['Solano', 'del Mar', 'Mirador', 'Central', 'Imperial', 'Azahar', 'La Bahía', 'San Rafael', 'Las Palmas', 'El Faro', 'Brisa', 'Los Almendros', 'Vista Alegre', 'Del Puerto', 'Santa Clara', 'El Carmen', 'Nueva', 'La Perla', 'Del Sol', 'Marina'];
+const INDUSTRIAL_B = ['Logística', 'Naval', 'Pesquera', 'de Conservas', 'Metalúrgica', 'del Muelle', 'Frigorífica', 'Textil', 'de Cargas', 'Portuaria'];
 
-const ROOFS = {
-  old:   ['#b5654a', '#a85f46', '#c07a52', '#9c5a44', '#bb6e4e'],
-  down:  ['#5b7a99', '#4f6d8c', '#68879f', '#546e87', '#61798f', '#48637e'],
-  ind:   ['#7a7f85', '#6e7276', '#85898d', '#62676b', '#767c80'],
-  sub:   ['#c98d5f', '#bf8455', '#d29a68', '#b57e50', '#cb9263'],
-  playa: ['#e0b56a', '#d9ac5e', '#e6c078', '#d2a457'],
-  harb:  ['#6b7f8c', '#5f7382', '#778b99', '#667c8a'],
-};
-const WALLS = {
-  old: '#8a4a38', down: '#3c5269', ind: '#4c5054', sub: '#9a6c42',
-  playa: '#b98f45', harb: '#47585f',
-};
-const NAMES = {
-  down: ['Banco Solano', 'Torre Mirador', 'Hotel Mirador', 'Oficinas Brisa',
-    'Galería Central', 'Torre Faro', 'Edificio Coral', 'Banco del Puerto',
-    'Hotel Palma Real', 'Oficinas Vega', 'Torre Azul', 'Centro Comercial Sol'],
-  old: ['Capilla San Solano', 'Mercado Viejo', 'Casa Herrera', 'Posada Antigua',
-    'Taller Ramos', 'Panadería La Espiga', 'Casa del Reloj', 'Museo Solano'],
-  ind: ['Fábrica Norte', 'Almacén Vega', 'Planta de Hielo', 'Depósito Ferro',
-    'Fábrica de Redes', 'Taller Industrial', 'Almacén Gris', 'Planta Sur'],
-  sub: ['Casa Flores', 'Casa Miranda', 'Villa Rosa', 'Casa Paredes',
-    'Casa Luna', 'Villa Jazmín', 'Casa Robles', 'Casa Fuentes'],
-  playa: ['Hotel Brisa Marina', 'Café Ola', 'Hotel Arena', 'Bar El Ancla',
-    'Hotel Coral Playa', 'Café Delfín'],
-  harb: ['Almacén Brisa', 'Almacén Pulpo', 'Depósito Muelle', 'Almacén Sal',
-    'Lonja del Puerto', 'Almacén Ferro'],
-};
+function inRect(tx, ty, r) {
+  return tx >= r.x0 && tx <= r.x1 && ty >= r.y0 && ty <= r.y1;
+}
+
+/** Land shape before any dressing: mainland, bay carve-out, island. */
+function landAt(tx, ty) {
+  if (tx >= ISLAND.x0 && tx <= ISLAND.x1 && ty >= ISLAND.y0 && ty <= ISLAND.y1) return true;
+  if (tx < 10 || tx > 178 || ty < 10 || ty > 230) return false;
+  if (tx >= BAY.x && ty >= BAY.y0 && ty <= BAY.y1) return false;
+  return true;
+}
+
+/** District of a tile, by region. Water tiles still report the nearest district for ambience. */
+function districtTile(tx, ty) {
+  if (tx >= ISLAND.x0 - 6 && ty >= ISLAND.y0 - 8 && ty <= ISLAND.y1 + 8) return D.ISLA;
+  if (tx >= 116 && ty >= 58 && ty <= 176) return D.PUERTO;
+  if (tx >= 64 && tx < 116 && ty >= 58 && ty < 148) return D.CENTRO;
+  if (tx < 52 && ty >= 82 && ty < 172) return D.PLAYA;
+  if (ty < 86) return D.COLINAS;
+  if (ty >= 146 && tx < 86) return D.BARRIO;
+  if (ty >= 146) return D.INDUSTRIAL;
+  return D.CENTRO;
+}
 
 export function generateCity(seed) {
-  const rng = new RNG(seed);
-  const tiles = new Uint8Array(N * N);
+  const tiles = new Uint8Array(W * W);
+  const districtMap = new Uint8Array(W * W);
+  const idx = (tx, ty) => ty * W + tx;
+  const inWorld = (tx, ty) => tx >= 0 && ty >= 0 && tx < W && ty < W;
+
+  // --- Land and shore -------------------------------------------------------
+  for (let ty = 0; ty < W; ty += 1) {
+    for (let tx = 0; tx < W; tx += 1) {
+      districtMap[idx(tx, ty)] = districtTile(tx, ty);
+      if (!landAt(tx, ty)) { tiles[idx(tx, ty)] = T.WATER; continue; }
+      tiles[idx(tx, ty)] = T.GRASS;
+    }
+  }
+  // Sand on any land tile next to water (the beaches), before roads override it.
+  for (let ty = 0; ty < W; ty += 1) {
+    for (let tx = 0; tx < W; tx += 1) {
+      if (tiles[idx(tx, ty)] !== T.GRASS) continue;
+      let shore = false;
+      for (let dy = -1; dy <= 1 && !shore; dy += 1) {
+        for (let dx = -1; dx <= 1; dx += 1) {
+          if (inWorld(tx + dx, ty + dy) && tiles[idx(tx + dx, ty + dy)] === T.WATER) { shore = true; break; }
+        }
+      }
+      if (shore) tiles[idx(tx, ty)] = T.SAND;
+    }
+  }
+
+  // --- Avenues ---------------------------------------------------------------
+  const carveAvenueX = (c, x0, x1) => {
+    for (let ty = x0; ty <= x1; ty += 1) {
+      for (let d = -2; d <= 2; d += 1) {
+        const tx = c + d;
+        if (!inWorld(tx, ty) || !landAt(tx, ty)) continue;
+        tiles[idx(tx, ty)] = d >= -1 && d <= 1 ? T.ROAD : T.SIDEWALK;
+      }
+    }
+  };
+  const carveAvenueY = (c, y0, y1) => {
+    for (let tx = y0; tx <= y1; tx += 1) {
+      for (let d = -2; d <= 2; d += 1) {
+        const ty = c + d;
+        if (!inWorld(tx, ty) || !landAt(tx, ty)) continue;
+        tiles[idx(tx, ty)] = d >= -1 && d <= 1 ? T.ROAD : T.SIDEWALK;
+      }
+    }
+  };
+  for (const c of AVENUES_X) carveAvenueX(c, 12, 228);
+  for (const c of AVENUES_Y) carveAvenueY(c, 12, 176);
+  for (const c of ISLAND_AX) carveAvenueX(c, ISLAND.y0 + 2, ISLAND.y1 - 2);
+  for (const c of ISLAND_AY) carveAvenueY(c, ISLAND.x0 + 2, ISLAND.x1 - 2);
+
+  // Causeway bridge: deck tiles over the bay and the open water to the island.
+  for (let tx = BAY.x; tx < ISLAND.x0; tx += 1) {
+    for (let ty = CAUSEWAY.y0; ty <= CAUSEWAY.y1; ty += 1) {
+      tiles[idx(tx, ty)] = T.BRIDGE;
+      districtMap[idx(tx, ty)] = tx >= ISLAND.x0 - 8 ? D.ISLA : D.PUERTO;
+    }
+  }
+  // Mainland end of the causeway ties into the avenue grid at ty 126's row band.
+  for (let tx = 144; tx < BAY.x; tx += 1) {
+    for (let ty = CAUSEWAY.y0; ty <= CAUSEWAY.y1; ty += 1) {
+      if (landAt(tx, ty)) tiles[idx(tx, ty)] = T.ROAD;
+    }
+  }
+
+  // --- El Puerto piers --------------------------------------------------------
+  const pierRows = [100, 116, 140, 156];
+  for (const py of pierRows) {
+    for (let tx = BAY.x; tx <= BAY.x + 7; tx += 1) {
+      tiles[idx(tx, py)] = T.DOCK;
+      tiles[idx(tx, py + 1)] = T.DOCK;
+    }
+  }
+
+  // --- Blocks ------------------------------------------------------------------
+  // Bands of buildable tiles between avenue sidewalks, per axis.
+  function bands(avenues, lo, hi) {
+    const out = [];
+    let start = lo;
+    const edges = [...avenues].sort((a, b) => a - b);
+    for (const c of edges) {
+      if (c - 3 > start) out.push([start, c - 3]);
+      start = c + 3;
+    }
+    if (hi >= start) out.push([start, hi]);
+    return out.filter(([a, b]) => b - a >= 3);
+  }
+  const bandsX = bands(AVENUES_X, 13, 175);
+  const bandsY = bands(AVENUES_Y, 13, 227);
+  const islandBandsX = bands(ISLAND_AX, ISLAND.x0 + 2, ISLAND.x1 - 2);
+  const islandBandsY = bands(ISLAND_AY, ISLAND.y0 + 2, ISLAND.y1 - 2);
+
+  const blocks = [];
+  function collectBlocks(bx, by, island) {
+    for (const [x0, x1] of bx) {
+      for (const [y0, y1] of by) {
+        // Subdivide wide bands (e.g. east of the last avenue) into block-sized pieces.
+        for (let sx = x0; sx <= x1; sx += 13) {
+          for (let sy = y0; sy <= y1; sy += 13) {
+            const ex = Math.min(x1, sx + 12);
+            const ey = Math.min(y1, sy + 12);
+            if (ex - sx < 3 || ey - sy < 3) continue;
+            const cx = Math.floor((sx + ex) / 2);
+            const cy = Math.floor((sy + ey) / 2);
+            if (!landAt(cx, cy)) continue;
+            if (tiles[idx(cx, cy)] === T.WATER) continue;
+            blocks.push({ x0: sx, y0: sy, x1: ex, y1: ey, cx, cy, island, district: districtMap[idx(cx, cy)], use: 'buildings' });
+          }
+        }
+      }
+    }
+  }
+  collectBlocks(bandsX, bandsY, false);
+  collectBlocks(islandBandsX, islandBandsY, true);
+
+  // A few blocks become plazas and parks instead of buildings.
+  const rngLayout = createRandom(seed ^ 0x1a2b3c);
+  for (const b of blocks) {
+    if (b.island) continue;
+    if (b.district === D.COLINAS && rngLayout.chance(0.45)) b.use = 'park';
+    else if (b.district === D.CENTRO && rngLayout.chance(0.14)) b.use = 'plaza';
+    else if (b.district === D.BARRIO && rngLayout.chance(0.12)) b.use = 'plaza';
+    else if (b.district === D.PLAYA && rngLayout.chance(0.2)) b.use = 'plaza';
+    else if (rngLayout.chance(0.06)) b.use = 'yard';
+  }
+  function paintBlock(b, tile) {
+    for (let ty = b.y0; ty <= b.y1; ty += 1) {
+      for (let tx = b.x0; tx <= b.x1; tx += 1) {
+        if (landAt(tx, ty)) tiles[idx(tx, ty)] = tile;
+      }
+    }
+  }
+  for (const b of blocks) {
+    if (b.use === 'park') paintBlock(b, T.PARK);
+    else if (b.use === 'plaza') paintBlock(b, T.PLAZA);
+    else if (b.use === 'yard') paintBlock(b, T.FLOOR);
+  }
+
+  // Reserve the block nearest a target point for a functional location.
+  function reserveBlock(tx, ty, tag) {
+    let best = null;
+    let bestDist = Infinity;
+    for (const b of blocks) {
+      if (b.use !== 'buildings' && b.use !== 'yard') continue;
+      const d = (b.cx - tx) * (b.cx - tx) + (b.cy - ty) * (b.cy - ty);
+      if (d < bestDist) { bestDist = d; best = b; }
+    }
+    if (best) { best.use = 'special'; best.tag = tag; }
+    return best;
+  }
+  const blockHospital = reserveBlock(86, 70, 'hospital');
+  const blockPolice = reserveBlock(102, 102, 'police');
+  const blockGun = reserveBlock(118, 86, 'gunshop');
+  const blockCustoms = reserveBlock(118, 166, 'customs');
+  const blockSafehouse = reserveBlock(54, 166, 'safehouse');
+  const blockWarehouse = reserveBlock(134, 150, 'warehouse');
+  const blockIslandHouse = reserveBlock(224, 122, 'islandHouse');
+
+  // --- Buildings ---------------------------------------------------------------
   const buildings = [];
-  const solids = [];
-  const props = [];
-  const lamps = [];
-  const shops = [];
-  const packages = [];
-  const parkedSpots = [];
+  const rngBuild = createRandom(seed ^ 0x4d5e6f);
+  let nameCounter = 0;
 
-  const idx = (tx, ty) => ty * N + tx;
-  const inB = (tx, ty) => tx >= 0 && ty >= 0 && tx < N && ty < N;
-  const set = (tx, ty, v) => { if (inB(tx, ty)) tiles[idx(tx, ty)] = v; };
-  const get = (tx, ty) => (inB(tx, ty) ? tiles[idx(tx, ty)] : T.WATER);
-  const districtOfBlock = (bx, by) => DISTRICT_TABLE[by][bx];
-
-  // ---- base terrain: grass everywhere, avenues carved as road ----------
-  for (let ty = 0; ty < N; ty++) {
-    for (let tx = 0; tx < N; tx++) {
-      const onRoad = (tx % BAND) < ROAD_W || (ty % BAND) < ROAD_W;
-      tiles[idx(tx, ty)] = onRoad ? T.ROAD : T.GRASS;
-    }
-  }
-  // ---- the bay: water along the south, beach and docks in front of it --
-  for (let tx = 0; tx < N; tx++) {
-    for (let ty = 230; ty < N; ty++) set(tx, ty, T.WATER);
-    for (let ty = 224; ty < 230; ty++) {
-      const bx = Math.min(9, Math.floor(tx / BAND));
-      const d = districtOfBlock(bx, 9);
-      if (d === 'playa') set(tx, ty, T.SAND);
-      else if (d === 'harb') set(tx, ty, T.DOCK);
-    }
-  }
-  // ---- Isla Brisa: a small island in the bay, reached by one bridge ----
-  for (let ty = 233; ty < N; ty++) {
-    for (let tx = 90; tx < 150; tx++) {
-      if ((tx % BAND) < ROAD_W) continue; // the avenues run onto the island
-      set(tx, ty, ty >= 238 ? T.SAND : T.GRASS);
-    }
-  }
-  for (let ty = 216; ty < N; ty++) {           // the causeway avenue (band 96)
-    for (let tx = 96; tx < 100; tx++) {
-      if (get(tx, ty) === T.WATER) set(tx, ty, T.BRIDGE);
-    }
+  function buildingName(district) {
+    nameCounter += 1;
+    const a = NAME_A[(nameCounter * 7 + district * 3) % NAME_A.length];
+    if (district === D.INDUSTRIAL) return `${a} ${INDUSTRIAL_B[(nameCounter * 5) % INDUSTRIAL_B.length]}`;
+    const b = NAME_B[(nameCounter * 11 + district) % NAME_B.length];
+    return `${a} ${b}`;
   }
 
-  // ---- per-block construction ------------------------------------------
-  const addBuilding = (bx, by, ox, oy, w, h, opts = {}) => {
-    const x = (bx * BAND + 4 + ox) * TILE, y = (by * BAND + 4 + oy) * TILE;
-    const d = districtOfBlock(bx, by);
-    const b = {
-      x, y, w: w * TILE, h: h * TILE,
-      name: opts.name || null,
-      shop: opts.shop || null,
-      color: opts.color || rng.pick(ROOFS[d]),
-      wall: WALLS[d],
-      district: d,
-      door: { x: x + (w * TILE) / 2, y: y + h * TILE + 14 },
+  function addBuilding(tx0, ty0, tx1, ty1, district, forcedName) {
+    // Never build on water: a plot that reaches the shore is skipped whole.
+    for (let ty = ty0; ty <= ty1; ty += 1) {
+      for (let tx = tx0; tx <= tx1; tx += 1) {
+        if (!inWorld(tx, ty) || tiles[idx(tx, ty)] === T.WATER) return null;
+      }
+    }
+    const x = tx0 * TILE;
+    const y = ty0 * TILE;
+    const w = (tx1 - tx0 + 1) * TILE;
+    const h = (ty1 - ty0 + 1) * TILE;
+    for (let ty = ty0; ty <= ty1; ty += 1) {
+      for (let tx = tx0; tx <= tx1; tx += 1) tiles[idx(tx, ty)] = T.BUILDING;
+    }
+    const palette = ROOF_PALETTES[district] || ROOF_PALETTES[D.CENTRO];
+    const roof = palette[Math.floor(hash2(tx0, ty0) * palette.length)];
+    const floors = 2 + Math.floor(hash2(tx1, ty1) * 6);
+    // Door: midpoint of the side whose outward neighbour is closest to a road tile.
+    const sides = [
+      { x: x + w / 2, y: y + h + 14, nx: 0, ny: 1 },
+      { x: x + w / 2, y: y - 14, nx: 0, ny: -1 },
+      { x: x + w + 14, y: y + h / 2, nx: 1, ny: 0 },
+      { x: x - 14, y: y + h / 2, nx: -1, ny: 0 },
+    ];
+    let door = sides[0];
+    let doorScore = Infinity;
+    for (const s of sides) {
+      for (let step = 1; step <= 8; step += 1) {
+        const ttx = Math.floor((s.x + s.nx * step * 16) / TILE);
+        const tty = Math.floor((s.y + s.ny * step * 16) / TILE);
+        if (!inWorld(ttx, tty)) break;
+        const t = tiles[idx(ttx, tty)];
+        if (t === T.ROAD || t === T.SIDEWALK || t === T.PLAZA || t === T.BRIDGE) {
+          if (step < doorScore) { doorScore = step; door = s; }
+          break;
+        }
+        if (t === T.BUILDING) break;
+      }
+    }
+    const building = {
+      id: buildings.length,
+      x, y, w, h, district,
+      name: forcedName || buildingName(district),
+      roof, floors,
+      door: { x: door.x, y: door.y },
+      shop: null,
     };
-    buildings.push(b); solids.push(b);
-    return b;
-  };
-  const ringSidewalk = (bx, by) => {
-    const x0 = bx * BAND + 4, y0 = by * BAND + 4;
-    for (let i = 0; i < 20; i++) {
-      set(x0 + i, y0, T.SIDEWALK); set(x0 + i, y0 + 19, T.SIDEWALK);
-      set(x0, y0 + i, T.SIDEWALK); set(x0 + 19, y0 + i, T.SIDEWALK);
-    }
-  };
-  const fillBlock = (bx, by, v) => {
-    const x0 = bx * BAND + 4, y0 = by * BAND + 4;
-    for (let ty = 0; ty < 20; ty++) for (let tx = 0; tx < 20; tx++) set(x0 + tx, y0 + ty, v);
-  };
-  const usedNames = new Set();
-  const flavorName = (d) => {
-    const list = NAMES[d].filter((n) => !usedNames.has(n));
-    if (!list.length) return null;
-    const n = rng.pick(list); usedNames.add(n); return n;
-  };
+    buildings.push(building);
+    return building;
+  }
 
-  let hospital, policeStation, safehouseB, hotelB, terminalB;
-  let customsA, customsB, gunShopB, pulpoB, brisaB;
-  const spots = {};
-
-  for (let by = 0; by < 10; by++) {
-    for (let bx = 0; bx < 10; bx++) {
-      const d = districtOfBlock(bx, by);
-      const key = bx + ',' + by;
-      ringSidewalk(bx, by);
-
-      if (key === '1,1') {                       // Plaza Mayor, Barrio Viejo
-        fillBlock(bx, by, T.PLAZA);
-        const cx = (bx * BAND + 14) * TILE, cy = (by * BAND + 14) * TILE;
-        props.push({ kind: 'fountain', x: cx, y: cy });
-        for (let i = 0; i < 6; i++) props.push({ kind: 'bench', x: cx + rng.range(-140, 140), y: cy + rng.range(-140, 140) });
-        for (let i = 0; i < 8; i++) props.push({ kind: 'tree', x: (bx * BAND + rng.int(6, 21)) * TILE, y: (by * BAND + rng.int(6, 21)) * TILE });
-        spots.plaza = { x: cx, y: cy + 90 };
-        continue;
-      }
-      if (key === '2,5' || key === '6,5') {      // parks
-        fillBlock(bx, by, T.PARK);
-        for (let i = 0; i < 16; i++) props.push({ kind: 'tree', x: (bx * BAND + rng.int(6, 21)) * TILE, y: (by * BAND + rng.int(6, 21)) * TILE });
-        for (let i = 0; i < 4; i++) props.push({ kind: 'bench', x: (bx * BAND + rng.int(7, 20)) * TILE, y: (by * BAND + rng.int(7, 20)) * TILE });
-        spots[key === '2,5' ? 'parkWest' : 'parkEast'] = { x: (bx * BAND + 14) * TILE, y: (by * BAND + 14) * TILE };
-        continue;
-      }
-      if (key === '8,0') {                       // open industrial lot
-        fillBlock(bx, by, T.LOT);
-        for (let i = 0; i < 10; i++) {
-          const c = { kind: 'crate', x: (bx * BAND + rng.int(6, 20)) * TILE, y: (by * BAND + rng.int(6, 20)) * TILE, w: 26, h: 26 };
-          props.push(c); solids.push({ x: c.x - 13, y: c.y - 13, w: 26, h: 26 });
+  function fillBlock(b) {
+    // Subdivide the block interior (1 tile margin) into plots of 3-5 tiles with 1-tile gaps.
+    const x0 = b.x0 + 1;
+    const y0 = b.y0 + 1;
+    const x1 = b.x1 - 1;
+    const y1 = b.y1 - 1;
+    let y = y0;
+    while (y <= y1 - 2) {
+      const ph = Math.min(rngBuild.int(3, 5), y1 - y + 1);
+      let x = x0;
+      while (x <= x1 - 2) {
+        const pw = Math.min(rngBuild.int(3, 5), x1 - x + 1);
+        if (pw >= 3 && ph >= 3 && rngBuild.chance(0.92)) {
+          addBuilding(x, y, x + pw - 1, y + ph - 1, b.district);
         }
-        spots.industrialYard = { x: (bx * BAND + 14) * TILE, y: (by * BAND + 14) * TILE };
-        continue;
+        x += pw + 1;
       }
-      if (d === 'playa' && by === 9) {           // the beach itself (dry rows only)
-        const x0 = bx * BAND + 4, y0 = by * BAND + 4;
-        for (let ty = 0; ty < 10; ty++) for (let tx = 0; tx < 20; tx++) set(x0 + tx, y0 + ty, T.SAND);
-        for (let i = 0; i < 7; i++) props.push({ kind: 'palm', x: (bx * BAND + rng.int(5, 22)) * TILE, y: (by * BAND + rng.int(5, 12)) * TILE });
-        continue;
-      }
-      if (d === 'harb' && by === 9) {            // dock front: one warehouse
-        addBuilding(bx, by, 2, 1, 16, 7, { name: flavorName('harb') });
-        for (let i = 0; i < 8; i++) {
-          const c = { kind: 'crate', x: (bx * BAND + rng.int(5, 21)) * TILE, y: (by * BAND + rng.int(11, 13)) * TILE, w: 26, h: 26 };
-          props.push(c); solids.push({ x: c.x - 13, y: c.y - 13, w: 26, h: 26 });
-        }
-        props.push({ kind: 'crane', x: (bx * BAND + 10) * TILE, y: (by * BAND + 12) * TILE });
-        continue;
-      }
-
-      // ordinary blocks, per district (skipped where a special building
-      // takes the block, so roofs never stack on the same plot)
-      const SPECIAL_BLOCKS = new Set(['4,2', '3,1', '5,3', '5,2', '6,3', '1,4', '8,1', '7,8', '8,8', '6,8']);
-      if (SPECIAL_BLOCKS.has(key)) {
-        // the special building below stands alone on this block
-      } else if (d === 'down' || d === 'old') {
-        const offs = [[1, 1], [11, 1], [1, 11], [11, 11]];
-        for (const [ox, oy] of offs) {
-          const named = rng.chance(0.3) ? flavorName(d) : null;
-          addBuilding(bx, by, ox, oy, 8, 8, { name: named });
-        }
-      } else if (d === 'ind' || d === 'harb') {
-        addBuilding(bx, by, 1, 1, 18, 8, { name: rng.chance(0.5) ? flavorName(d) : null });
-        addBuilding(bx, by, 1, 11, 18, 8, { name: rng.chance(0.4) ? flavorName(d) : null });
-        for (let i = 0; i < 4; i++) props.push({ kind: 'crate', x: (bx * BAND + rng.int(6, 20)) * TILE, y: (by * BAND + rng.int(10, 12)) * TILE });
-      } else if (d === 'sub') {
-        const offs = [[1, 2], [8, 2], [14, 2], [1, 12], [8, 12], [14, 12]];
-        for (const [ox, oy] of offs) addBuilding(bx, by, ox, oy, 5, 4, { name: rng.chance(0.22) ? flavorName('sub') : null });
-        for (let i = 0; i < 3; i++) props.push({ kind: 'tree', x: (bx * BAND + rng.int(6, 21)) * TILE, y: (by * BAND + rng.int(6, 21)) * TILE });
-      } else if (d === 'playa') {
-        const offs = [[1, 2], [11, 2], [6, 11]];
-        for (const [ox, oy] of offs) addBuilding(bx, by, ox, oy, 8, 6, { name: rng.chance(0.45) ? flavorName('playa') : null });
-        for (let i = 0; i < 3; i++) props.push({ kind: 'palm', x: (bx * BAND + rng.int(6, 21)) * TILE, y: (by * BAND + rng.int(6, 21)) * TILE });
-      }
-
-      // special buildings override one plot of their block
-      if (key === '4,2') gunShopB = addBuilding(bx, by, 11, 1, 8, 8, { name: 'Armas Solano', shop: 'gun', color: '#7a4a8c' });
-      if (key === '3,1') hospital = addBuilding(bx, by, 1, 1, 18, 8, { name: 'Hospital San Solano', color: '#dfe6ea' });
-      if (key === '5,3') policeStation = addBuilding(bx, by, 1, 1, 18, 8, { name: 'Comisaría Central', color: '#33506e' });
-      if (key === '5,2') hotelB = addBuilding(bx, by, 11, 1, 8, 8, { name: 'Hotel Mirador', color: '#8c6d3f' });
-      if (key === '6,3') terminalB = addBuilding(bx, by, 1, 11, 18, 8, { name: 'Terminal de Buses', color: '#5f7382' });
-      if (key === '1,4') safehouseB = addBuilding(bx, by, 1, 2, 5, 4, { name: 'Casa de Dario', color: '#a85751' });
-      if (key === '8,1') customsA = addBuilding(bx, by, 1, 11, 18, 8, { name: 'Solano Customs', shop: 'customs', color: '#6a4a8c' });
-      if (key === '7,8') customsB = addBuilding(bx, by, 1, 1, 18, 8, { name: 'Solano Customs — Muelle', shop: 'customs', color: '#6a4a8c' });
-      if (key === '8,8') {
-        pulpoB = addBuilding(bx, by, 1, 1, 18, 8, { name: 'Almacén Pulpo', color: '#54423a' });
-        // El Pulpo's yard: the asphalt apron south of the warehouse, keyed
-        // to the building plot. Fixed offsets and no rng draws, so every
-        // other block of the seeded city stays exactly as it was.
-        const ytx = Math.floor(pulpoB.x / TILE), yty = Math.floor((pulpoB.y + pulpoB.h) / TILE);
-        const yw = Math.floor(pulpoB.w / TILE);
-        for (let ty = yty; ty < yty + 10; ty++) for (let tx = ytx; tx < ytx + yw; tx++) set(tx, ty, T.LOT);
-        for (const [ox, oy] of [[168, 26], [200, 26], [184, 58], [-192, 126], [-160, 126], [-72, 6]]) {
-          const c = { kind: 'crate', x: pulpoB.door.x + ox, y: pulpoB.door.y + 40 + oy, w: 26, h: 26 };
-          props.push(c); solids.push({ x: c.x - 13, y: c.y - 13, w: 26, h: 26 });
-        }
-      }
-      if (key === '6,8') brisaB = addBuilding(bx, by, 1, 1, 18, 8, { name: 'Almacén Brisa', color: '#5f7382' });
+      y += ph + 1;
     }
   }
 
-  // ---- shops -------------------------------------------------------------
-  const shopFromBuilding = (b, type) => shops.push({ type, name: b.name, x: b.x + b.w / 2, y: b.y + b.h / 2, door: b.door });
-  shopFromBuilding(gunShopB, 'gun');
-  shopFromBuilding(customsA, 'customs');
-  shopFromBuilding(customsB, 'customs');
-  const foodSpots = [
-    ['Tacos El Faro', spots.plaza.x - 120, spots.plaza.y - 40],
-    ['Mariscos La Ola', (2 * BAND + 12) * TILE, (9 * BAND + 10) * TILE],
-    ['Dulces Sol', (6 * BAND + 14) * TILE, (5 * BAND + 6) * TILE],
-    ['Café Puerto', (7 * BAND + 12) * TILE, (9 * BAND + 12) * TILE],
-    ['Antojitos Centro', (5 * BAND + 8) * TILE, (5 * BAND + 20) * TILE],
-  ];
-  for (const [name, x, y] of foodSpots) {
-    props.push({ kind: 'foodstand', x, y });
-    shops.push({ type: 'food', name, x, y, door: { x, y: y + 26 } });
+  function specialBuilding(b, name, shop) {
+    // One landmark building centred in its block, with its yard painted as floor/plaza.
+    paintBlock(b, b.tag === 'warehouse' || b.tag === 'customs' ? T.FLOOR : T.PLAZA);
+    const bw = Math.min(b.x1 - b.x0 - 3, 7);
+    const bh = Math.min(b.y1 - b.y0 - 3, 6);
+    const tx0 = b.cx - Math.floor(bw / 2);
+    const ty0 = b.cy - Math.floor(bh / 2);
+    const building = addBuilding(tx0, ty0, tx0 + bw, ty0 + bh, b.district, name);
+    if (building) building.shop = shop;
+    return building;
   }
 
-  // ---- streetlights along the avenues ------------------------------------
-  // One lamp every 12 tiles on each side of every avenue; the lamps array
-  // is what the renderer lights up after dark.
-  for (let b = 0; b < 10; b++) {
-    const s = b * BAND;
-    for (let t = 8; t < N - 4; t += 12) {
-      lamps.push({ x: s * TILE - 8, y: t * TILE });            // vertical avenue, west side
-      lamps.push({ x: (s + ROAD_W) * TILE + 8, y: t * TILE }); // vertical avenue, east side
-      lamps.push({ x: t * TILE, y: s * TILE - 8 });            // horizontal avenue, north side
-      lamps.push({ x: t * TILE, y: (s + ROAD_W) * TILE + 8 }); // horizontal avenue, south side
-    }
-  }
-  for (const l of lamps) props.push({ kind: 'lamp', x: l.x, y: l.y });
-  // scattered hydrants on sidewalks
-  for (let i = 0; i < 46; i++) {
-    const bx = rng.int(0, 9), by = rng.int(0, 9);
-    props.push({ kind: 'hydrant', x: (bx * BAND + rng.pick([4, 23])) * TILE + 16, y: (by * BAND + rng.int(5, 22)) * TILE });
+  const landmarks = {};
+  if (blockHospital) landmarks.hospital = specialBuilding(blockHospital, 'Hospital San Solano', 'hospital');
+  if (blockPolice) landmarks.police = specialBuilding(blockPolice, 'Comisaría Central', 'police');
+  if (blockGun) landmarks.gunshop = specialBuilding(blockGun, 'Armas Solano', 'gunshop');
+  if (blockCustoms) landmarks.customs = specialBuilding(blockCustoms, 'Solano Customs', 'customs');
+  if (blockSafehouse) landmarks.safehouse = specialBuilding(blockSafehouse, 'Casa de Darío', 'safehouse');
+  if (blockWarehouse) landmarks.warehouse = specialBuilding(blockWarehouse, 'Almacén Pulpo', 'warehouse');
+  if (blockIslandHouse) landmarks.islandHouse = specialBuilding(blockIslandHouse, 'Casa del Pulpo', 'islandHouse');
+
+  for (const b of blocks) {
+    if (b.use === 'buildings') fillBlock(b);
   }
 
-  // ---- traffic lanes & intersections --------------------------------------
-  const lanesH = [], lanesV = [], intersections = [];
-  for (let b = 0; b < 10; b++) {
-    const start = b * BAND;
-    lanesH.push({ fixed: (start + 2) * TILE + TILE / 2, dir: 1 });
-    lanesH.push({ fixed: (start + 1) * TILE + TILE / 2, dir: -1 });
-    lanesV.push({ fixed: (start + 1) * TILE + TILE / 2, dir: 1 });
-    lanesV.push({ fixed: (start + 2) * TILE + TILE / 2, dir: -1 });
-  }
-  for (let by = 0; by < 10; by++) for (let bx = 0; bx < 10; bx++) {
-    intersections.push({ x: (bx * BAND + 2) * TILE, y: (by * BAND + 2) * TILE });
-  }
-
-  // ---- parked cars ---------------------------------------------------------
-  const carTypes = ['compact', 'sedan', 'muscle', 'pickup', 'taxi'];
-  for (let i = 0; i < 52; i++) {
-    const horiz = rng.chance(0.5);
-    const band = rng.int(0, 9) * BAND;
-    const along = rng.int(6, 232);
-    if (horiz) parkedSpots.push({ x: along * TILE + 16, y: (band + (rng.chance(0.5) ? 0 : 3)) * TILE + 16, angle: rng.chance(0.5) ? 0 : Math.PI, type: rng.pick(carTypes) });
-    else parkedSpots.push({ x: (band + (rng.chance(0.5) ? 0 : 3)) * TILE + 16, y: along * TILE + 16, angle: rng.chance(0.5) ? Math.PI / 2 : -Math.PI / 2, type: rng.pick(carTypes) });
-  }
-  // taxis wait at the stands
-  const taxiStands = [
-    { x: hotelB.door.x, y: hotelB.door.y + 30 },
-    { x: hospital.door.x, y: hospital.door.y + 30 },
-    { x: terminalB.door.x, y: terminalB.door.y - 30 },
-    { x: (3 * BAND + 12) * TILE, y: (9 * BAND + 8) * TILE },
-    { x: spots.plaza.x + 140, y: spots.plaza.y + 60 },
-  ];
-
-  // ---- hidden packages ------------------------------------------------------
-  const pkgTiles = [
-    [14, 14], [70, 130], [158, 130], [100, 30], [206, 46], [222, 222], [30, 222],
-    [238, 120], [120, 238], [10, 10], [46, 190], [100, 100], [190, 190], [60, 60],
-    [150, 236], [98, 110], [30, 110], [210, 110], [120, 60], [180, 30],
-  ];
-  pkgTiles.forEach(([tx, ty], i) => packages.push({ id: i, x: tx * TILE + 16, y: ty * TILE + 16 }));
-
-  // ---- mission & activity spots ----------------------------------------------
-  spots.darioHouse = { x: safehouseB.door.x, y: safehouseB.door.y };
-  spots.customsDock = { x: customsB.door.x, y: customsB.door.y };
-  spots.harborWarehouse = { x: brisaB.door.x, y: brisaB.door.y };
-  spots.pulpoYard = { x: pulpoB.door.x, y: pulpoB.door.y + 40 };
-  spots.hotel = { x: hotelB.door.x, y: hotelB.door.y };
-  spots.gunShop = { x: gunShopB.door.x, y: gunShopB.door.y };
-  spots.island = { x: 120 * TILE, y: 235 * TILE };
-  const raceStart = { x: (8 * BAND + 2) * TILE, y: (8 * BAND + 2) * TILE };
-  const raceCheckpoints = [[2, 1], [5, 2], [8, 4], [6, 7], [3, 8], [1, 5], [4, 3], [7, 1]]
-    .map(([bx, by]) => ({ x: (bx * BAND + 2) * TILE, y: (by * BAND + 2) * TILE }));
-
-  // ---- harbour boats, courier stops & the Isla Brisa race -----------------
-  // Fixed-coordinate additions placed AFTER all seeded generation above:
-  // they take no draws from the `rng` stream, so the city built so far is
-  // byte-identical to before for a given seed.
-  const boatSpots = [
-    { x: 4992, y: 7408, angle: 0, type: 'dinghy' },          // El Puerto front, bx6
-    { x: 5760, y: 7408, angle: Math.PI, type: 'speedboat' }, // bx7
-    { x: 6528, y: 7408, angle: 0, type: 'dinghy' },          // bx8
-    { x: 7296, y: 7408, angle: Math.PI, type: 'speedboat' }, // bx9
-    { x: 3360, y: 7440, angle: Math.PI, type: 'dinghy' },    // Isla Brisa north shore
-    { x: 4320, y: 7440, angle: 0, type: 'speedboat' },       // Isla Brisa north shore
-    { x: 1920, y: 7408, angle: 0, type: 'dinghy' },          // La Playa front
-  ];
-  spots.boatDock = { x: 4992, y: 229 * TILE + 16 };   // dock tile in front of the first harbour boat
-  spots.islandDock = { x: 4320, y: 233 * TILE + 16 }; // island grass at the north shore
-  const courierSpots = [
-    { name: 'Terminal de Buses', x: terminalB.door.x, y: terminalB.door.y + 10 },
-    { name: 'Hotel Mirador', x: hotelB.door.x, y: hotelB.door.y + 10 },
-    { name: 'Plaza Mayor', x: spots.plaza.x, y: spots.plaza.y },
-    { name: 'Almacén Brisa', x: brisaB.door.x, y: brisaB.door.y + 10 },
-    { name: 'Comisaría Central', x: policeStation.door.x, y: policeStation.door.y + 10 },
-    { name: 'La Playa', x: taxiStands[3].x, y: taxiStands[3].y },
-  ];
-  const race2Start = { x: (7 * BAND + 2) * TILE, y: (8 * BAND + 2) * TILE };
-  const islaCheckpoints = [
-    { x: 3904, y: 6208 }, // harbour avenue
-    { x: 3136, y: 6976 }, // causeway north
-    { x: 3104, y: 7584 }, // island SW (causeway bridge)
-    // (3872, 7584) as first specified lands on WATER: the island avenue
-    // band tx 120-123 is never carved (only the tx 96-99 causeway becomes
-    // BRIDGE), so this uses the nearest SAND tile instead, (118, 238).
-    { x: 3776, y: 7616 }, // island SE (south-row sand)
-    { x: 3872, y: 6976 }, // NE avenue
-    { x: 5440, y: 6208 }, // finish at race2Start
-  ];
-
-  // ---- visual-density props (decorative, NON-solid) ------------------------
-  // A separate pass with its OWN rng (seed ^ 0x9e3779b9): it only appends to
-  // `props`, never touches `solids`, and cannot perturb the main rng stream.
-  const rng2 = new RNG(seed ^ 0x9e3779b9);
-  const doorPts = [];
-  for (const b of buildings) doorPts.push(b.door);
-  for (const s of shops) doorPts.push(s.door);
-  const nearDoor = (x, y) => doorPts.some((d) => Math.hypot(d.x - x, d.y - y) < 40);
-  const usedPropTiles = new Set();
-  const scatterProps = (kind, cap, isCandidate, withHue) => {
-    const candidates = [];
-    for (let ty = 0; ty < N; ty++) {
-      for (let tx = 0; tx < N; tx++) {
-        if (isCandidate(get(tx, ty), tx, ty)) candidates.push([tx, ty]);
-      }
-    }
-    // Shuffle with rng2 so capped props spread over the whole map instead
-    // of clustering in the first rows the scan reaches. RNG.shuffle makes
-    // the same draws in the same order this pass always made inline, so
-    // the scattered props — hues included — come out identical.
-    rng2.shuffle(candidates);
-    let placed = 0;
-    for (const [tx, ty] of candidates) {
-      if (placed >= cap) break;
-      const key = tx + ',' + ty;
-      if (usedPropTiles.has(key)) continue;
-      const cx = tx * TILE + TILE / 2, cy = ty * TILE + TILE / 2;
-      if (nearDoor(cx, cy)) continue;
-      if (!rng2.chance(0.65)) continue;
-      const prop = { kind, x: cx + rng2.range(-6, 6), y: cy + rng2.range(-6, 6) };
-      if (withHue) prop.hue = rng2.int(0, 3);
-      props.push(prop);
-      usedPropTiles.add(key);
-      placed++;
-    }
+  // --- Props -------------------------------------------------------------------
+  // Decorative and (for crates/dumpsters/barrels) solid street furniture, scattered by rule
+  // from its own stream so it never perturbs the building draws.
+  const props = [];
+  const rngProps = createRandom(seed ^ 0x70721);
+  const propAt = (tx, ty, kind, solid) => {
+    props.push({
+      x: tx * TILE + TILE / 2 + rngProps.range(-6, 6),
+      y: ty * TILE + TILE / 2 + rngProps.range(-6, 6),
+      kind, solid: !!solid, rot: rngProps.range(0, Math.PI * 2), hue: rngProps.next(),
+    });
   };
-  const blockDistrict = (tx, ty) => districtOfBlock(
-    Math.min(9, Math.floor(tx / BAND)), Math.min(9, Math.floor(ty / BAND)));
-  scatterProps('umbrella', 14, (t) => t === T.SAND, true);
-  scatterProps('towel', 16, (t) => t === T.SAND, false);
-  scatterProps('stall', 6, (t, tx, ty) => t === T.SIDEWALK && blockDistrict(tx, ty) === 'playa', false);
-  scatterProps('dumpster', 22, (t, tx, ty) => t === T.SIDEWALK && (blockDistrict(tx, ty) === 'down' || blockDistrict(tx, ty) === 'ind'), false);
-  scatterProps('barrel', 20, (t) => t === T.DOCK, true);
-  scatterProps('bench', 14, (t) => t === T.PARK || t === T.PLAZA, false);
+  const tileIs = (tx, ty, kind) => inWorld(tx, ty) && tiles[idx(tx, ty)] === kind;
 
+  // Lamps: along avenue sidewalks, alternating sides, plus the causeway.
+  for (let ty = 14; ty <= 228; ty += 6) {
+    const side = (ty / 6) % 2 === 0 ? -2 : 2;
+    for (const c of AVENUES_X) {
+      if (tileIs(c + side, ty, T.SIDEWALK)) propAt(c + side, ty, 'lamp', false);
+    }
+  }
+  for (let tx = BAY.x + 2; tx < ISLAND.x0; tx += 5) {
+    propAt(tx, CAUSEWAY.y0, 'lamp', false);
+    propAt(tx, CAUSEWAY.y1, 'lamp', false);
+  }
+  // Palms and umbrellas on the sand; benches on plazas and parks; stalls on market plazas.
+  for (let ty = 0; ty < W; ty += 1) {
+    for (let tx = 0; tx < W; tx += 1) {
+      const t = tiles[idx(tx, ty)];
+      const d = districtMap[idx(tx, ty)];
+      if (t === T.SAND && rngProps.chance(0.11)) propAt(tx, ty, 'palm', false);
+      else if (t === T.SAND && rngProps.chance(0.10)) propAt(tx, ty, 'umbrella', false);
+      else if (t === T.PLAZA && rngProps.chance(0.07)) propAt(tx, ty, 'bench', false);
+      else if (t === T.PLAZA && (d === D.BARRIO || d === D.PLAYA) && rngProps.chance(0.06)) propAt(tx, ty, 'stall', true);
+      else if (t === T.PARK && rngProps.chance(0.10)) propAt(tx, ty, 'palm', false);
+      else if (t === T.PARK && rngProps.chance(0.06)) propAt(tx, ty, 'bench', false);
+    }
+  }
+  // Crates and barrels around the docks, the warehouse and industrial yards.
+  for (let ty = 0; ty < W; ty += 1) {
+    for (let tx = 0; tx < W; tx += 1) {
+      const t = tiles[idx(tx, ty)];
+      const d = districtMap[idx(tx, ty)];
+      if (t === T.DOCK && rngProps.chance(0.30)) propAt(tx, ty, 'crate', true);
+      else if (t === T.DOCK && rngProps.chance(0.12)) propAt(tx, ty, 'barrel', true);
+      else if (t === T.FLOOR && (d === D.INDUSTRIAL || d === D.PUERTO) && rngProps.chance(0.12)) propAt(tx, ty, 'crate', true);
+      else if (t === T.FLOOR && d === D.INDUSTRIAL && rngProps.chance(0.05)) propAt(tx, ty, 'barrel', true);
+    }
+  }
+  // Dumpsters in the alleys: grass/floor tiles right behind buildings.
+  for (const b of buildings) {
+    if (rngProps.chance(0.4)) {
+      const tx = Math.floor((b.x + b.w + 20) / TILE);
+      const ty = Math.floor((b.y + b.h / 2) / TILE);
+      if (inWorld(tx, ty) && tiles[idx(tx, ty)] !== T.BUILDING && tiles[idx(tx, ty)] !== T.WATER && tiles[idx(tx, ty)] !== T.ROAD) {
+        props.push({ x: b.x + b.w + 20, y: b.y + b.h / 2, kind: 'dumpster', solid: true, rot: 0, hue: rngProps.next() });
+      }
+    }
+  }
+
+  // --- Parked cars ---------------------------------------------------------------
+  const parkedCars = [];
+  const rngPark = createRandom(seed ^ 0x9a11);
+  const CAR_TYPE_KEYS = ['compact', 'sedan', 'muscle', 'pickup', 'taxi'];
+  const CAR_PAINTS = ['#c23b2e', '#2e6fc2', '#e0a51f', '#3f9e4d', '#e8e6df', '#565b63', '#7a3f8c', '#c26a1b', '#2b2e33', '#87b5c9'];
+  for (let i = 0; i < 900 && parkedCars.length < 56; i += 1) {
+    const vertical = rngPark.chance(0.5);
+    const avenue = vertical ? rngPark.pick([...AVENUES_X, ...ISLAND_AX]) : rngPark.pick([...AVENUES_Y, ...ISLAND_AY]);
+    const along = rngPark.int(16, 224);
+    const lane = rngPark.pick([-1, 1]);
+    const tx = vertical ? avenue + lane : along;
+    const ty = vertical ? along : avenue + lane;
+    if (!tileIs(tx, ty, T.ROAD) && !tileIs(tx, ty, T.BRIDGE)) continue;
+    const type = rngPark.pick(CAR_TYPE_KEYS);
+    parkedCars.push({
+      x: tx * TILE + TILE / 2,
+      y: ty * TILE + TILE / 2,
+      angle: vertical ? (lane > 0 ? Math.PI / 2 : -Math.PI / 2) : (lane > 0 ? 0 : Math.PI),
+      type,
+      color: type === 'taxi' ? '#f2b21b' : rngPark.pick(CAR_PAINTS),
+    });
+  }
+
+  // --- Hidden packages --------------------------------------------------------------
+  const packageCandidates = [];
+  for (const b of buildings) {
+    packageCandidates.push({ x: b.x + 14, y: b.y + 14 });
+    packageCandidates.push({ x: b.x + b.w - 14, y: b.y + b.h - 14 });
+  }
+  for (const p of props) if (p.kind === 'crate') packageCandidates.push({ x: p.x, y: p.y - 10 });
+  rngProps.shuffle(packageCandidates);
+  const packages = packageCandidates.slice(0, 20).map((p, i) => ({ id: i, x: p.x, y: p.y, taken: false }));
+
+  // --- Functional spots --------------------------------------------------------------
+  function nearestTilePoint(tx, ty, kinds) {
+    for (let r = 0; r <= 14; r += 1) {
+      for (let dy = -r; dy <= r; dy += 1) {
+        for (let dx = -r; dx <= r; dx += 1) {
+          const x = tx + dx;
+          const y = ty + dy;
+          if (inWorld(x, y) && kinds.includes(tiles[idx(x, y)])) {
+            return { x: x * TILE + TILE / 2, y: y * TILE + TILE / 2 };
+          }
+        }
+      }
+    }
+    return { x: tx * TILE, y: ty * TILE };
+  }
+  const doorOf = (b) => (b ? { x: b.door.x, y: b.door.y } : { x: 0, y: 0 });
+  const spots = {
+    spawn: landmarks.safehouse ? { x: landmarks.safehouse.door.x, y: landmarks.safehouse.door.y + 26 } : { x: 54 * TILE, y: 170 * TILE },
+    hospital: doorOf(landmarks.hospital),
+    police: doorOf(landmarks.police),
+    gunshop: doorOf(landmarks.gunshop),
+    customs: doorOf(landmarks.customs),
+    safehouse: doorOf(landmarks.safehouse),
+    warehouse: doorOf(landmarks.warehouse),
+    islandHouse: doorOf(landmarks.islandHouse),
+    marisol: nearestTilePoint(30, 122, [T.PLAZA, T.SIDEWALK, T.SAND]),
+    islandDock: { x: (ISLAND.x0 + 4) * TILE, y: (ISLAND.y0 - 2) * TILE },
+    taxiStands: [
+      nearestTilePoint(92, 74, [T.SIDEWALK, T.PLAZA]),
+      nearestTilePoint(34, 130, [T.SIDEWALK, T.PLAZA]),
+      nearestTilePoint(58, 162, [T.SIDEWALK, T.PLAZA]),
+      nearestTilePoint(140, 120, [T.SIDEWALK, T.DOCK]),
+    ],
+    raceHarbour: { x: 142 * TILE + 16, y: 100 * TILE + 16 },
+    raceIsla: { x: (ISLAND.x0 + 6) * TILE, y: 129 * TILE },
+    courierSpots: [
+      nearestTilePoint(86, 102, [T.PLAZA, T.SIDEWALK]),
+      nearestTilePoint(84, 72, [T.PLAZA, T.SIDEWALK]),
+      nearestTilePoint(32, 128, [T.PLAZA, T.SIDEWALK]),
+      nearestTilePoint(56, 168, [T.PLAZA, T.SIDEWALK]),
+      nearestTilePoint(146, 148, [T.DOCK, T.FLOOR, T.SIDEWALK]),
+      nearestTilePoint(214, 138, [T.PLAZA, T.SIDEWALK]),
+    ],
+    boatSpots: [
+      { x: (BAY.x + 9) * TILE, y: 101 * TILE, type: 'dinghy', angle: 0 },
+      { x: (BAY.x + 9) * TILE, y: 117 * TILE, type: 'speedboat', angle: 0 },
+      { x: (BAY.x + 9) * TILE, y: 141 * TILE, type: 'dinghy', angle: 0 },
+      { x: (BAY.x + 9) * TILE, y: 157 * TILE, type: 'speedboat', angle: 0 },
+      { x: (ISLAND.x0 + 3) * TILE, y: (ISLAND.y0 - 3) * TILE, type: 'speedboat', angle: Math.PI / 2 },
+      { x: (ISLAND.x0 + 10) * TILE, y: (ISLAND.y0 - 3) * TILE, type: 'dinghy', angle: Math.PI / 2 },
+      { x: 6 * TILE, y: 128 * TILE, type: 'dinghy', angle: Math.PI },
+    ],
+  };
+
+  // --- Solids index ---------------------------------------------------------------------
+  const CELL = 128;
+  const gridW = Math.ceil((W * TILE) / CELL);
+  const solidGrid = new Map();
+  const solidRects = [];
+  function addSolid(x, y, w, h) {
+    const rect = { x, y, w, h };
+    solidRects.push(rect);
+    const cx0 = Math.max(0, Math.floor(x / CELL));
+    const cy0 = Math.max(0, Math.floor(y / CELL));
+    const cx1 = Math.min(gridW - 1, Math.floor((x + w) / CELL));
+    const cy1 = Math.min(gridW - 1, Math.floor((y + h) / CELL));
+    for (let cy = cy0; cy <= cy1; cy += 1) {
+      for (let cx = cx0; cx <= cx1; cx += 1) {
+        const key = cy * gridW + cx;
+        if (!solidGrid.has(key)) solidGrid.set(key, []);
+        solidGrid.get(key).push(rect);
+      }
+    }
+  }
+  for (const b of buildings) addSolid(b.x, b.y, b.w, b.h);
+  for (const p of props) {
+    if (!p.solid) continue;
+    const s = p.kind === 'dumpster' ? 30 : p.kind === 'crate' ? 24 : 18;
+    addSolid(p.x - s / 2, p.y - s / 2, s, s);
+  }
+
+  function querySolids(x, y, r, out) {
+    out.length = 0;
+    const cx0 = Math.max(0, Math.floor((x - r) / CELL));
+    const cy0 = Math.max(0, Math.floor((y - r) / CELL));
+    const cx1 = Math.min(gridW - 1, Math.floor((x + r) / CELL));
+    const cy1 = Math.min(gridW - 1, Math.floor((y + r) / CELL));
+    for (let cy = cy0; cy <= cy1; cy += 1) {
+      for (let cx = cx0; cx <= cx1; cx += 1) {
+        const cell = solidGrid.get(cy * gridW + cx);
+        if (!cell) continue;
+        for (let i = 0; i < cell.length; i += 1) {
+          if (!out.includes(cell[i])) out.push(cell[i]);
+        }
+      }
+    }
+    return out;
+  }
+
+  // --- Public face ----------------------------------------------------------------------
   const city = {
-    seed, tiles, buildings, solids, props, lamps, shops, packages, parkedSpots,
-    lanesH, lanesV, intersections, taxiStands, spots, raceStart, raceCheckpoints,
-    boatSpots, courierSpots, race2Start, islaCheckpoints,
-    safehouse: { x: safehouseB.x + safehouseB.w / 2, y: safehouseB.y + safehouseB.h / 2, door: safehouseB.door },
-    hospital: { x: hospital.x + hospital.w / 2, y: hospital.y + hospital.h / 2, door: hospital.door },
-    policeStation: { x: policeStation.x + policeStation.w / 2, y: policeStation.y + policeStation.h / 2, door: policeStation.door },
-    playerStart: { x: safehouseB.door.x, y: safehouseB.door.y + 44, angle: Math.PI / 2 },
-    tileAt(tx, ty) { return get(tx, ty); },
-    tileAtPx(x, y) { return get(Math.floor(x / TILE), Math.floor(y / TILE)); },
-    districtAt(x, y) {
-      const bx = Math.max(0, Math.min(9, Math.floor(x / TILE / BAND)));
-      const by = Math.max(0, Math.min(9, Math.floor(y / TILE / BAND)));
-      if (y > 232 * TILE) return { id: 'isla', name: 'Isla Brisa', sub: 'The Island' };
-      const id = DISTRICT_TABLE[by][bx];
-      return { id, ...DISTRICT_INFO[id] };
+    seed,
+    w: W,
+    h: W,
+    tile: TILE,
+    tiles,
+    districtMap,
+    buildings,
+    props,
+    packages,
+    parkedCars,
+    spots,
+    landmarks,
+    avenuesX: AVENUES_X,
+    avenuesY: AVENUES_Y,
+    islandAvenuesX: ISLAND_AX,
+    islandAvenuesY: ISLAND_AY,
+    querySolids,
+    tileAt(tx, ty) {
+      if (tx < 0 || ty < 0 || tx >= W || ty >= W) return T.WATER;
+      return tiles[ty * W + tx];
+    },
+    tileAtPx(x, y) {
+      return city.tileAt(Math.floor(x / TILE), Math.floor(y / TILE));
+    },
+    districtAtPx(x, y) {
+      const tx = Math.min(W - 1, Math.max(0, Math.floor(x / TILE)));
+      const ty = Math.min(W - 1, Math.max(0, Math.floor(y / TILE)));
+      return districtMap[ty * W + tx];
+    },
+    isRoadPx(x, y) {
+      const t = city.tileAtPx(x, y);
+      return t === T.ROAD || t === T.BRIDGE;
     },
   };
   return city;

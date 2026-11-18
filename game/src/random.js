@@ -1,55 +1,81 @@
-// PORT SOLANO — random.js
-// A small seeded generator (mulberry32). The city is built from one fixed
-// seed so Port Solano is the same city on every visit, and the screenshot
-// scenes stay reproducible.
+// Seedable randomness: one small deterministic generator (mulberry32) plus the handful of
+// helpers the city builder and the game logic share. A city built from a seed must come out
+// identical on every machine, so the city builder draws only from generators made here and
+// never from Math.random.
 
-export function mulberry32(seed) {
-  let a = seed >>> 0;
-  return function () {
-    a |= 0; a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+/**
+ * Create a generator from a 32-bit seed. The returned object is the whole API:
+ *   next()            float in [0, 1)
+ *   range(a, b)       float in [a, b)
+ *   int(a, b)         integer in [a, b] inclusive
+ *   chance(p)         true with probability p
+ *   pick(array)       one element (undefined for an empty array)
+ *   shuffle(array)    in-place Fisher-Yates, returns the array
+ *   pickWeighted(es)  entries are [value, weight] pairs; a zero weight never wins, an
+ *                     all-zero list falls back to a uniform pick, empty gives undefined
+ *   sign()            -1 or 1
+ */
+export function createRandom(seed) {
+  let state = (seed >>> 0) || 0x9e3779b9;
+
+  function next() {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let t = state;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-export class RNG {
-  constructor(seed) { this.next = mulberry32(seed); }
-  float() { return this.next(); }
-  range(min, max) { return min + this.next() * (max - min); }
-  int(min, max) { return Math.floor(this.range(min, max + 1)); }
-  pick(arr) { return arr[Math.floor(this.next() * arr.length)]; }
-  chance(p) { return this.next() < p; }
-  sign() { return this.next() < 0.5 ? -1 : 1; }
-
-  // In-place Fisher–Yates shuffle driven by this stream: one int(0, i)
-  // draw per slot, from the last slot down to the second. That is the
-  // exact draw pattern the city generator's prop scatter used to spell
-  // out inline, so swapping the inline loop for this helper leaves the
-  // generated city byte-identical. Returns the same array, shuffled.
-  shuffle(arr) {
-    for (let i = arr.length - 1; i > 0; i--) {
-      const j = this.int(0, i);
-      const tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp;
-    }
-    return arr;
   }
 
-  // Weighted pick from [value, weight] pairs: a value's chance of being
-  // drawn is its share of the total weight. Entries with a non-positive
-  // weight never win; if every weight is non-positive the pick falls
-  // back to a uniform draw over the values, and an empty list yields
-  // undefined. Consumes exactly one draw on the weighted path.
-  pickWeighted(entries) {
+  function range(a, b) {
+    return a + next() * (b - a);
+  }
+
+  function int(a, b) {
+    return a + Math.floor(next() * (b - a + 1));
+  }
+
+  function chance(p) {
+    return next() < p;
+  }
+
+  function pick(array) {
+    if (!array || array.length === 0) return undefined;
+    return array[Math.floor(next() * array.length)];
+  }
+
+  function shuffle(array) {
+    for (let i = array.length - 1; i > 0; i -= 1) {
+      const j = Math.floor(next() * (i + 1));
+      const tmp = array[i];
+      array[i] = array[j];
+      array[j] = tmp;
+    }
+    return array;
+  }
+
+  function pickWeighted(entries) {
+    if (!entries || entries.length === 0) return undefined;
     let total = 0;
-    for (const [, w] of entries) if (w > 0) total += w;
-    if (total <= 0) return entries.length ? this.pick(entries)[0] : undefined;
-    let roll = this.next() * total;
-    for (const [value, w] of entries) {
-      if (w <= 0) continue;
-      roll -= w;
-      if (roll < 0) return value;
+    for (let i = 0; i < entries.length; i += 1) total += Math.max(0, entries[i][1]);
+    if (total <= 0) return pick(entries)[0];
+    let roll = next() * total;
+    for (let i = 0; i < entries.length; i += 1) {
+      roll -= Math.max(0, entries[i][1]);
+      if (roll <= 0) return entries[i][0];
     }
     return entries[entries.length - 1][0];
   }
+
+  function sign() {
+    return next() < 0.5 ? -1 : 1;
+  }
+
+  return { next, range, int, chance, pick, shuffle, pickWeighted, sign };
+}
+
+/** A stable 32-bit hash of two integers (tile coords, building ids): decoration without a stream. */
+export function hash2(a, b) {
+  let h = (Math.imul(a, 374761393) + Math.imul(b, 668265263)) >>> 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177) >>> 0;
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
 }

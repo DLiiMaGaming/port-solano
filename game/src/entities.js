@@ -1,686 +1,849 @@
-// PORT SOLANO — entities.js
-// The moving things: vehicles (shared physics for the player, traffic and
-// police), pedestrians with walk / flee / hostile behaviour, bullets,
-// particles, skid marks and cash pickups. Crimes are not judged here —
-// they are pushed onto state.events and the wanted system (police.js)
-// decides who saw what.
+// Entities: factories, physics and the per-frame updates for the player, pedestrians,
+// traffic, boats, bullets and particles. Pure simulation — nothing here touches the DOM,
+// and sound goes through state.audio (a stub in the headless harness), so the whole file
+// runs under Node for testing.
+//
+// Crimes are not judged here: anything the law would care about is pushed onto
+// state.crimes as {kind, x, y} and police.js consumes the queue each tick.
 
-import { TILE, T, VEHICLE_TYPES, BOAT_TYPES, MAX_PARTICLES, MAX_SKIDS } from './config.js';
+import { TILE, T, PLAYER, WEAPONS, CAR_TYPES, BOAT_TYPES, CAPS, ARMOR_ABSORB } from './config.js';
 
-const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
-const dist2 = (ax, ay, bx, by) => { const dx = ax - bx, dy = ay - by; return dx * dx + dy * dy; };
-export function angleLerp(a, b, t) {
-  let d = (b - a) % (Math.PI * 2);
-  if (d > Math.PI) d -= Math.PI * 2;
-  if (d < -Math.PI) d += Math.PI * 2;
-  return a + d * clamp(t, 0, 1);
-}
-export function angleDiff(a, b) {
-  // Signed turn from b to a, normalised to [-PI, PI]. Every caller passes
-  // (targetAngle, currentAngle) and steers by the result, so this must be
-  // a - b: with the subtraction reversed, traffic and police steered AWAY
-  // from their targets (cars U-turned out of lanes, cruisers veered off
-  // mid-pursuit) — found in the screenshot polish round, 2026-11-18.
-  let d = (a - b) % (Math.PI * 2);
-  if (d > Math.PI) d -= Math.PI * 2;
-  if (d < -Math.PI) d += Math.PI * 2;
-  return d;
+export function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+export function lerp(a, b, t) { return a + (b - a) * t; }
+export function dist(x1, y1, x2, y2) { return Math.hypot(x2 - x1, y2 - y1); }
+
+/** Wrap an angle to [-PI, PI). */
+export function angleWrap(a) {
+  while (a >= Math.PI) a -= Math.PI * 2;
+  while (a < -Math.PI) a += Math.PI * 2;
+  return a;
 }
 
-// ------------------------------------------------------------- collision
-// A circle is blocked by water tiles and by the city's solid AABBs
-// (buildings and crates). moveCircle slides along obstacles axis by axis.
-export function circleBlocked(city, x, y, r) {
-  const tx0 = Math.floor((x - r) / TILE), tx1 = Math.floor((x + r) / TILE);
-  const ty0 = Math.floor((y - r) / TILE), ty1 = Math.floor((y + r) / TILE);
-  for (let ty = ty0; ty <= ty1; ty++) for (let tx = tx0; tx <= tx1; tx++) {
-    if (city.tileAt(tx, ty) === T.WATER) return true;
+/** Signed shortest turn from `from` to `to`, in [-PI, PI). Positive = clockwise (y-down). */
+export function angleDiff(from, to) {
+  return angleWrap(to - from);
+}
+
+/** Turn `current` toward `target` by at most `maxStep` radians. */
+export function turnToward(current, target, maxStep) {
+  const d = angleDiff(current, target);
+  if (Math.abs(d) <= maxStep) return target;
+  return current + Math.sign(d) * maxStep;
+}
+
+// ---------------------------------------------------------------------------
+// Ground and collision
+
+export function isWaterTile(t) { return t === T.WATER; }
+
+/** Tiles a person can stand on (everything but water and building footprints). */
+export function isWalkableTile(t) { return t !== T.WATER && t !== T.BUILDING; }
+
+/** Top-speed multiplier for a car standing on this tile: asphalt is fast, sand is not. */
+export function groundFactor(tile) {
+  switch (tile) {
+    case T.ROAD: case T.BRIDGE: return 1;
+    case T.FLOOR: case T.PLAZA: return 0.82;
+    case T.SIDEWALK: case T.DOCK: return 0.85;
+    case T.GRASS: case T.PARK: return 0.55;
+    case T.SAND: return 0.48;
+    default: return 0.7;
   }
-  for (const s of city.solids) {
-    if (x + r > s.x && x - r < s.x + s.w && y + r > s.y && y - r < s.y + s.h) return true;
+}
+
+const solidScratch = [];
+
+/** Does a circle at (x, y) with radius r touch a solid rect or a blocked tile? */
+function circleBlocked(city, x, y, r, mode) {
+  const solids = city.querySolids(x, y, r + 40, solidScratch);
+  for (let i = 0; i < solids.length; i += 1) {
+    const s = solids[i];
+    const nx = clamp(x, s.x, s.x + s.w);
+    const ny = clamp(y, s.y, s.y + s.h);
+    const dx = x - nx;
+    const dy = y - ny;
+    if (dx * dx + dy * dy < r * r) return true;
   }
-  return x - r < 0 || y - r < 0 || x + r > city.tiles.length / 240 * TILE || y + r > 240 * TILE;
-}
-
-export function moveCircle(city, o, r, nx, ny) {
-  let hitX = false, hitY = false;
-  if (!circleBlocked(city, nx, o.y, r)) o.x = nx; else hitX = true;
-  if (!circleBlocked(city, o.x, ny, r)) o.y = ny; else hitY = true;
-  return { hitX, hitY };
-}
-
-// The mirror image for boats: a hull is blocked by everything that is
-// NOT open water — land tiles of every kind, the bridge deck (boats do
-// not pass under the causeway) and the city's solid AABBs.
-export function circleBlockedLand(city, x, y, r) {
-  const tx0 = Math.floor((x - r) / TILE), tx1 = Math.floor((x + r) / TILE);
-  const ty0 = Math.floor((y - r) / TILE), ty1 = Math.floor((y + r) / TILE);
-  for (let ty = ty0; ty <= ty1; ty++) for (let tx = tx0; tx <= tx1; tx++) {
-    if (city.tileAt(tx, ty) !== T.WATER) return true;
+  const tx0 = Math.floor((x - r) / TILE);
+  const tx1 = Math.floor((x + r) / TILE);
+  const ty0 = Math.floor((y - r) / TILE);
+  const ty1 = Math.floor((y + r) / TILE);
+  for (let ty = ty0; ty <= ty1; ty += 1) {
+    for (let tx = tx0; tx <= tx1; tx += 1) {
+      const t = city.tileAt(tx, ty);
+      const blocked = mode === 'water' ? t !== T.WATER : (t === T.WATER || t === T.BUILDING);
+      if (!blocked) continue;
+      const nx = clamp(x, tx * TILE, tx * TILE + TILE);
+      const ny = clamp(y, ty * TILE, ty * TILE + TILE);
+      const dx = x - nx;
+      const dy = y - ny;
+      if (dx * dx + dy * dy < r * r) return true;
+    }
   }
-  for (const s of city.solids) {
-    if (x + r > s.x && x - r < s.x + s.w && y + r > s.y && y - r < s.y + s.h) return true;
+  return false;
+}
+
+/**
+ * Move an entity by (dx, dy), sliding along whatever blocks it. `mode` is 'land' (blocked
+ * by water, buildings and solid props) or 'water' (blocked by everything that is not
+ * water). Returns true if the full move was not possible.
+ */
+export function collideMove(city, ent, dx, dy, r, mode) {
+  let hit = false;
+  if (dx !== 0) {
+    if (circleBlocked(city, ent.x + dx, ent.y, r, mode)) { hit = true; } else ent.x += dx;
   }
-  return x - r < 0 || y - r < 0 || x + r > city.tiles.length / 240 * TILE || y + r > 240 * TILE;
+  if (dy !== 0) {
+    if (circleBlocked(city, ent.x, ent.y + dy, r, mode)) { hit = true; } else ent.y += dy;
+  }
+  ent.x = clamp(ent.x, r, city.w * TILE - r);
+  ent.y = clamp(ent.y, r, city.h * TILE - r);
+  return hit;
 }
 
-export function moveCircleWater(city, o, r, nx, ny) {
-  let hitX = false, hitY = false;
-  if (!circleBlockedLand(city, nx, o.y, r)) o.x = nx; else hitX = true;
-  if (!circleBlockedLand(city, o.x, ny, r)) o.y = ny; else hitY = true;
-  return { hitX, hitY };
-}
+// ---------------------------------------------------------------------------
+// Factories
 
-// -------------------------------------------------------------- vehicles
-let nextCarId = 1;
-export function createVehicle(city, type, x, y, angle, opts = {}) {
-  const def = VEHICLE_TYPES[type];
+let nextId = 1;
+
+export function createPlayer(x, y) {
   return {
-    id: nextCarId++, kind: opts.kind || 'parked', type, def,
-    x, y, angle, vx: 0, vy: 0, speed: 0,
-    hp: def.durability, maxHp: def.durability,
-    color: opts.color || def.colors[Math.floor(Math.random() * def.colors.length)],
-    lane: opts.lane || null, turnCd: Math.random() * 4,
-    cruise: 0.45 + Math.random() * 0.25, panic: 0, blockedT: 0, honkT: 0,
-    dead: false, smokeT: 0, marked: !!opts.marked, driverOut: false,
-    sirenPhase: Math.random() * 6.28, skidL: null, skidR: null,
+    id: nextId++, kind: 'player', x, y, angle: -Math.PI / 2,
+    hp: PLAYER.hp, radius: PLAYER.radius,
+    fireCd: 0, fireLatch: false, stepT: 0, walkPhase: 0, moving: false,
+    dead: false,
   };
 }
 
-export function carSpeed(car) { return Math.hypot(car.vx, car.vy); }
+const CIV_SHIRTS = ['#c2b280', '#7a9cc2', '#c27a7a', '#7ac28a', '#b28ac2', '#e0d6c2', '#5f7a8c', '#c98f4e', '#8c5f6e', '#4e7a6e'];
+const CIV_PANTS = ['#3a3f4a', '#5a4632', '#2e3a5a', '#6e6e6e', '#42352a'];
 
-// One physics step. ctrl = { throttle: -1..1, steer: -1..1, handbrake }.
-export function stepVehicle(state, car, ctrl, dt) {
-  const def = car.def;
-  const fx = Math.cos(car.angle), fy = Math.sin(car.angle);
-  let vf = car.vx * fx + car.vy * fy;                    // forward speed
-  let vlx = car.vx - vf * fx, vly = car.vy - vf * fy;    // lateral slide
-  const tile = state.city.tileAtPx(car.x, car.y);
-  const offroad = tile !== T.ROAD && tile !== T.BRIDGE && tile !== T.LOT && tile !== T.DOCK;
-  const healthF = 0.5 + 0.5 * (car.hp / car.maxHp);
-  const top = def.topSpeed * (offroad ? 0.55 : 1) * healthF;
-
-  if (car.dead) ctrl = { throttle: 0, steer: 0, handbrake: true };
-  if (ctrl.throttle > 0) {
-    vf += def.accel * ctrl.throttle * dt * (vf < 0 ? 2.4 : 1);
-  } else if (ctrl.throttle < 0) {
-    vf -= def.accel * (vf > 5 ? 1.7 : 0.8) * dt;
-  }
-  vf -= vf * (offroad ? 1.1 : 0.45) * dt;                // rolling drag
-  vf = clamp(vf, -def.reverse, Math.max(top, 0));
-  if (!ctrl.throttle && Math.abs(vf) < 3) vf = 0;
-
-  const steerAuthority = clamp(Math.abs(vf) / 70, 0, 1);
-  car.angle += ctrl.steer * def.turn * steerAuthority * dt * (vf < 0 ? -1 : 1) * (ctrl.handbrake ? 1.3 : 1);
-
-  const grip = ctrl.handbrake ? def.grip * 0.3 : def.grip;
-  const keep = Math.exp(-grip * dt);
-  vlx *= keep; vly *= keep;
-
-  const nfx = Math.cos(car.angle), nfy = Math.sin(car.angle);
-  car.vx = nfx * vf + vlx; car.vy = nfy * vf + vly;
-  car.speed = vf;
-
-  const nx = car.x + car.vx * dt, ny = car.y + car.vy * dt;
-  const before = Math.hypot(car.vx, car.vy);
-  const hit = moveCircle(state.city, car, def.h * 0.92, nx, ny);
-  if (hit.hitX) car.vx = 0;
-  if (hit.hitY) car.vy = 0;
-  if ((hit.hitX || hit.hitY) && before > 130) {
-    const impact = before * (car === state.playerCar() ? 0.55 : 0.8);
-    damageCar(state, car, impact * 0.09, 'crash');
-    spawnParticles(state, 'spark', car.x + nfx * def.w * 0.5, car.y + nfy * def.w * 0.5, 10);
-    spawnParticles(state, 'smoke', car.x, car.y, 5);
-    if (state.audio) state.audio.crash(clamp(before / 380, 0.2, 1));
-    state.shake = Math.min(14, state.shake + before * 0.02);
-    state.events.push({ kind: 'crash', x: car.x, y: car.y, byPlayer: car === state.playerCar() });
-  }
-
-  // drift: skid marks + tyre smoke from the rear wheels
-  const latSpeed = Math.abs(car.vx * -nfy + car.vy * nfx);
-  const drifting = (latSpeed > 55 && Math.abs(vf) > 60) || (ctrl.handbrake && Math.abs(vf) > 120);
-  const rx = car.x - nfx * def.w * 0.32, ry = car.y - nfy * def.w * 0.32;
-  const px = -nfy * def.h * 0.42, py = nfx * def.h * 0.42;
-  if (drifting) {
-    addSkid(state, car, 'skidL', rx + px, ry + py);
-    addSkid(state, car, 'skidR', rx - px, ry - py);
-    if (Math.random() < 0.5) spawnParticles(state, 'smoke', rx, ry, 1);
-    if (state.audio && car === state.playerCar()) state.audio.skid();
-  } else { car.skidL = null; car.skidR = null; }
-
-  // damage smoke / fire
-  if (car.hp < car.maxHp * 0.35 && !car.dead) {
-    car.smokeT -= dt;
-    if (car.smokeT <= 0) { car.smokeT = 0.12; spawnParticles(state, 'smoke', car.x + nfx * 10, car.y + nfy * 10, 1); }
-  }
-  if (car.dead) {
-    car.smokeT -= dt;
-    if (car.smokeT <= 0) { car.smokeT = 0.2; spawnParticles(state, 'fire', car.x, car.y, 1); }
-  }
-  car.turnCd -= dt;
-  return car;
-}
-
-function addSkid(state, car, key, x, y) {
-  const prev = car[key];
-  if (prev && dist2(prev.x, prev.y, x, y) < 900) {
-    state.skids.push({ x1: prev.x, y1: prev.y, x2: x, y2: y, life: 9 });
-    if (state.skids.length > MAX_SKIDS) state.skids.shift();
-  }
-  car[key] = { x, y };
-}
-
-export function damageCar(state, car, amount, cause) {
-  if (car.dead) return;
-  car.hp -= amount;
-  if (car.hp <= 0) {
-    car.hp = 0; car.dead = true;
-    spawnParticles(state, 'fire', car.x, car.y, 16);
-    spawnParticles(state, 'smoke', car.x, car.y, 14);
-    spawnParticles(state, 'spark', car.x, car.y, 12);
-    if (state.audio) state.audio.crash(1);
-    state.shake = Math.min(16, state.shake + 6);
-    if (cause === 'bullet' && car.kind === 'police') {
-      state.events.push({ kind: 'crime', crime: 'killCop', x: car.x, y: car.y, certain: true });
-    }
-  }
-}
-
-// ------------------------------------------------------------------ boats
-// Watercraft share the cars' velocity decomposition but live by the
-// opposite collision rule (water only), steer wide and slide long, and
-// trail a foam wake. kind: 'moored' (tied up, boardable), 'police'
-// (the harbour patrol — its AI lives in police.js) or 'mission'.
-let nextBoatId = 1;
-export function createBoat(city, type, x, y, angle, opts = {}) {
-  const def = BOAT_TYPES[type];
+export function createPed(rng, x, y, role, opts = {}) {
+  const hostile = role === 'hostile';
+  const cop = role === 'cop';
   return {
-    id: nextBoatId++, kind: opts.kind || 'moored', type, def,
-    x, y, angle, vx: 0, vy: 0, speed: 0,
-    hp: def.durability, maxHp: def.durability,
-    color: opts.color || def.colors[Math.floor(Math.random() * def.colors.length)],
-    dead: false, smokeT: 0, wreckT: 0, marked: !!opts.marked,
-    bobPhase: Math.random() * 6.28, fireT: 0, leaving: false,
+    id: nextId++, kind: 'ped', x, y, angle: rng.range(0, Math.PI * 2),
+    role,
+    hp: opts.hp ?? (hostile ? 46 : cop ? 60 : 30),
+    maxHp: opts.hp ?? (hostile ? 46 : cop ? 60 : 30),
+    weapon: opts.weapon || (hostile ? 'pistol' : cop ? 'pistol' : 'fists'),
+    shirt: opts.shirt || (cop ? '#274268' : hostile ? '#4a2326' : rng.pick(CIV_SHIRTS)),
+    pants: opts.pants || (cop ? '#1d2432' : rng.pick(CIV_PANTS)),
+    name: opts.name || null,
+    radius: 12,
+    state: 'wander', tx: x, ty: y, waitT: rng.range(0, 2),
+    fireCd: rng.range(0.2, 0.9), walkPhase: rng.range(0, 6),
+    fleeX: 0, fleeY: 0, fleeT: 0,
+    dead: false, deathT: 0, inCar: null, beat: opts.beat || null, busting: false,
   };
 }
 
-export function boatSpeed(boat) { return Math.hypot(boat.vx, boat.vy); }
-
-// One physics step on water. ctrl = { throttle: -1..1, steer: -1..1 }.
-export function stepBoat(state, boat, ctrl, dt) {
-  const def = boat.def;
-  const fx = Math.cos(boat.angle), fy = Math.sin(boat.angle);
-  let vf = boat.vx * fx + boat.vy * fy;
-  let vlx = boat.vx - vf * fx, vly = boat.vy - vf * fy;
-  const healthF = 0.55 + 0.45 * (boat.hp / boat.maxHp);
-  const top = def.topSpeed * healthF;
-
-  if (boat.dead) ctrl = { throttle: 0, steer: 0 };
-  if (ctrl.throttle > 0) vf += def.accel * ctrl.throttle * dt * (vf < 0 ? 2.2 : 1);
-  else if (ctrl.throttle < 0) vf -= def.accel * 0.8 * dt;
-  vf -= vf * 0.62 * dt;                                   // water drag
-  vf = clamp(vf, -def.reverse, Math.max(top, 0));
-  if (!ctrl.throttle && Math.abs(vf) < 3) vf = 0;
-
-  // boats answer the helm slowly, and only while they have way on
-  const steerAuthority = clamp(Math.abs(vf) / 55, 0, 1);
-  boat.angle += ctrl.steer * def.turn * steerAuthority * dt * (vf < 0 ? -1 : 1);
-  const keep = Math.exp(-def.grip * dt);                  // long, lazy slide
-  vlx *= keep; vly *= keep;
-
-  const nfx = Math.cos(boat.angle), nfy = Math.sin(boat.angle);
-  boat.vx = nfx * vf + vlx; boat.vy = nfy * vf + vly;
-  boat.speed = vf;
-
-  const nx = boat.x + boat.vx * dt, ny = boat.y + boat.vy * dt;
-  const before = Math.hypot(boat.vx, boat.vy);
-  const hit = moveCircleWater(state.city, boat, def.h * 0.95, nx, ny);
-  if (hit.hitX) boat.vx = 0;
-  if (hit.hitY) boat.vy = 0;
-  if ((hit.hitX || hit.hitY) && before > 110) {
-    damageBoat(state, boat, before * 0.07, 'crash');
-    spawnParticles(state, 'splash', boat.x + nfx * def.w * 0.5, boat.y + nfy * def.w * 0.5, 8);
-    if (state.audio) state.audio.crash(clamp(before / 380, 0.2, 0.8));
-    state.shake = Math.min(12, state.shake + before * 0.015);
-  }
-
-  // the wake: foam at the stern while the boat has way on
-  if (Math.abs(vf) > 42 && !boat.dead) {
-    const sx = boat.x - nfx * def.w * 0.5, sy = boat.y - nfy * def.w * 0.5;
-    if (Math.random() < 0.75) spawnParticles(state, 'wake', sx, sy, 1);
-    if (Math.random() < 0.3) spawnParticles(state, 'splash', sx, sy, 1);
-  }
-  if (boat.hp < boat.maxHp * 0.35 && !boat.dead) {
-    boat.smokeT -= dt;
-    if (boat.smokeT <= 0) { boat.smokeT = 0.14; spawnParticles(state, 'smoke', boat.x + nfx * 10, boat.y + nfy * 10, 1); }
-  }
-  boat.bobPhase += dt * 1.7;
-  return boat;
-}
-
-export function damageBoat(state, boat, amount, cause) {
-  if (boat.dead) return;
-  boat.hp -= amount;
-  if (boat.hp <= 0) {
-    boat.hp = 0; boat.dead = true; boat.wreckT = 0;
-    spawnParticles(state, 'fire', boat.x, boat.y, 14);
-    spawnParticles(state, 'smoke', boat.x, boat.y, 12);
-    spawnParticles(state, 'splash', boat.x, boat.y, 12);
-    if (state.audio) state.audio.crash(0.9);
-    state.shake = Math.min(14, state.shake + 5);
-    if (cause === 'bullet' && boat.kind === 'police') {
-      state.events.push({ kind: 'crime', crime: 'killCop', x: boat.x, y: boat.y, certain: true });
-    }
-  }
-}
-
-// Moored boats just bob; wrecks settle and are cleaned up after a while.
-// (The police boat's brain is in police.js; it calls stepBoat itself.)
-export function updateBoats(state, dt) {
-  for (const b of state.boats) {
-    if (b.kind === 'police' && !b.dead) continue; // police.js drives it
-    if (b.dead) { b.wreckT += dt; continue; }
-    if (b !== state.player.inBoat) stepBoat(state, b, { throttle: 0, steer: 0 }, dt);
-  }
-  state.boats = state.boats.filter((b) => !(b.dead && b.wreckT > 24) && !b.removeMe);
-}
-
-// Traffic: follow the avenue lanes, turn at some intersections, stop for
-// obstacles, panic at nearby violence. Returns the ctrl for stepVehicle.
-export function trafficControl(state, car, dt) {
-  const ctrl = { throttle: 0, steer: 0, handbrake: false };
-  if (car.dead) return ctrl;
-  const city = state.city;
-  if (!car.lane) { assignLane(city, car); if (!car.lane) return ctrl; }
-  const L = car.lane;
-
-  // panic: gunfire or a crash close by empties the street
-  if (car.panic > 0) car.panic -= dt;
-  const threat = state.lastThreat;
-  if (threat && state.time - threat.t < 2.5 && dist2(car.x, car.y, threat.x, threat.y) < 260 * 260) {
-    car.panic = 1.6;
-  }
-
-  // maybe turn at an intersection
-  if (car.turnCd <= 0) {
-    for (const ix of city.intersections) {
-      if (Math.abs(car.x - ix.x) < 26 && Math.abs(car.y - ix.y) < 26) {
-        car.turnCd = 3 + Math.random() * 4;
-        if (Math.random() < 0.42) turnAtIntersection(city, car, ix);
-        break;
-      }
-    }
-  }
-
-  const ahead = car.panic > 0 ? 190 : 150;
-  const tx = L.axis === 'x' ? car.x + L.dir * ahead : L.fixed;
-  const ty = L.axis === 'x' ? L.fixed : car.y + L.dir * ahead;
-  const want = Math.atan2(ty - car.y, tx - car.x);
-  ctrl.steer = clamp(angleDiff(want, car.angle) * 2.4, -1, 1);
-
-  // obstacle scan just ahead
-  const fx = Math.cos(car.angle), fy = Math.sin(car.angle);
-  let blocked = false;
-  const probe = (o, r) => {
-    const px = car.x + fx * 58, py = car.y + fy * 58;
-    return dist2(px, py, o.x, o.y) < (r + 20) * (r + 20);
-  };
-  for (const o of state.cars) {
-    if (o !== car && probe(o, o.def.h)) { blocked = true; break; }
-  }
-  if (!blocked) for (const p of state.peds) {
-    if (!p.dead && probe(p, 10)) { blocked = true; break; }
-  }
-  if (!blocked && !state.player.inCar && probe(state.player, 10)) blocked = true;
-
-  const spd = carSpeed(car);
-  if (blocked) {
-    car.blockedT += dt;
-    ctrl.throttle = spd > 25 ? -0.7 : 0;
-    if (car.blockedT > 1.4 && state.audio && Math.random() < dt * 0.7) { state.audio.horn(); car.blockedT = 0.6; }
-  } else {
-    car.blockedT = 0;
-    const target = car.panic > 0 ? 1 : car.cruise;
-    ctrl.throttle = spd < car.def.topSpeed * target ? target : 0;
-  }
-  if (car.panic > 0) { // swerve away from the threat while fleeing
-    const away = Math.atan2(car.y - threat.y, car.x - threat.x);
-    ctrl.steer = clamp(angleDiff(away, car.angle) * 1.6, -1, 1);
-  }
-  return ctrl;
-}
-
-function assignLane(city, car) {
-  const horiz = Math.abs(Math.cos(car.angle)) > Math.abs(Math.sin(car.angle));
-  const lanes = horiz ? city.lanesH : city.lanesV;
-  let best = null, bd = Infinity;
-  for (const L of lanes) {
-    const fixed = horiz ? L.fixed : L.fixed;
-    const d = horiz ? Math.abs(car.y - fixed) : Math.abs(car.x - fixed);
-    if (d < bd) { bd = d; best = { axis: horiz ? 'x' : 'y', fixed: L.fixed, dir: L.dir }; }
-  }
-  car.lane = best;
-}
-
-function turnAtIntersection(city, car, ix) {
-  const L = car.lane;
-  const newAxis = L.axis === 'x' ? 'y' : 'x';
-  const dir = Math.random() < 0.5 ? 1 : -1;
-  const lanes = newAxis === 'x' ? city.lanesH : city.lanesV;
-  // the crossing avenue's band start, in tiles
-  const bandCoord = newAxis === 'x' ? ix.y : ix.x;
-  const bandStart = Math.floor(bandCoord / TILE / 24) * 24;
-  for (const c of lanes) {
-    const tile = Math.floor(c.fixed / TILE);
-    if (Math.floor(tile / 24) === Math.floor(bandStart / 24) && tile % 24 >= bandStart % 24 && c.dir === dir) {
-      car.lane = { axis: newAxis, fixed: c.fixed, dir };
-      return;
-    }
-  }
-  for (const c of lanes) if (c.dir === dir) { car.lane = { axis: newAxis, fixed: c.fixed, dir }; return; }
-}
-
-// Car vs car and car vs ped collisions for the active set.
-export function collideCars(state, dt) {
-  const cars = state.cars;
-  for (let i = 0; i < cars.length; i++) {
-    const a = cars[i];
-    for (let j = i + 1; j < cars.length; j++) {
-      const b = cars[j];
-      const rr = a.def.h + b.def.h + 6;
-      const d2 = dist2(a.x, a.y, b.x, b.y);
-      if (d2 > rr * rr || d2 === 0) continue;
-      const d = Math.sqrt(d2), push = (rr - d) / 2;
-      const ux = (b.x - a.x) / d, uy = (b.y - a.y) / d;
-      const aWas = { x: a.x, y: a.y }, bWas = { x: b.x, y: b.y };
-      moveCircle(state.city, a, a.def.h * 0.92, a.x - ux * push, a.y - uy * push);
-      moveCircle(state.city, b, b.def.h * 0.92, b.x + ux * push, b.y + uy * push);
-      const rel = Math.abs((a.vx - b.vx) * ux + (a.vy - b.vy) * uy);
-      const swap = 0.35;
-      const avn = a.vx * ux + a.vy * uy, bvn = b.vx * ux + b.vy * uy;
-      a.vx += ux * (bvn - avn) * swap; a.vy += uy * (bvn - avn) * swap;
-      b.vx += ux * (avn - bvn) * swap; b.vy += uy * (avn - bvn) * swap;
-      if (rel > 120) {
-        damageCar(state, a, rel * 0.05, 'crash');
-        damageCar(state, b, rel * 0.05, 'crash');
-        spawnParticles(state, 'spark', (a.x + b.x) / 2, (a.y + b.y) / 2, 8);
-        if (state.audio) state.audio.crash(clamp(rel / 340, 0.2, 0.9));
-        const playerInvolved = a === state.playerCar() || b === state.playerCar();
-        if (playerInvolved) {
-          state.shake = Math.min(14, state.shake + rel * 0.02);
-          const other = a === state.playerCar() ? b : a;
-          state.events.push({ kind: 'crime', crime: other.kind === 'police' ? 'hitCop' : 'hitCar', x: other.x, y: other.y });
-          state.events.push({ kind: 'crash', x: other.x, y: other.y, byPlayer: true });
-        }
-      }
-      void aWas; void bWas;
-    }
-  }
-  // cars running over pedestrians
-  for (const car of cars) {
-    const spd = carSpeed(car);
-    if (spd < 45) continue;
-    for (const p of state.peds) {
-      if (p.dead || p.downT > 0) continue;
-      if (dist2(car.x, car.y, p.x, p.y) < (car.def.h + 12) * (car.def.h + 12)) {
-        hurtPed(state, p, spd * 0.35, Math.atan2(p.y - car.y, p.x - car.x), car === state.playerCar());
-        if (car === state.playerCar()) {
-          state.events.push({ kind: 'crime', crime: 'hitAndRun', x: p.x, y: p.y });
-          state.shake = Math.min(12, state.shake + 3);
-        }
-      }
-    }
-  }
-}
-
-// ------------------------------------------------------------ pedestrians
-const SHIRTS = ['#d1603d', '#3d6ed1', '#3dd17a', '#d1c53d', '#a03dd1', '#e8e3d8', '#3dd1c5', '#d13d7a'];
-const PANTS = ['#2e3440', '#4a3b2a', '#31435c', '#5c3131', '#22332a'];
-let nextPedId = 1;
-export function createPed(x, y, opts = {}) {
+export function createCar(type, x, y, angle, color, role) {
+  const spec = CAR_TYPES[type];
   return {
-    id: nextPedId++, x, y, angle: Math.random() * 6.28,
-    hp: opts.hp || 40, maxHp: opts.hp || 40,
-    state: 'walk', target: null, waitT: Math.random() * 2,
-    hostile: !!opts.hostile, weapon: opts.weapon || null, fireT: Math.random(),
-    cop: !!opts.cop, beat: opts.beat || null,
-    downT: 0, dead: false, fadeT: 0, fleeFrom: null, fleeT: 0,
-    shirt: opts.cop ? '#274268' : (opts.shirt || SHIRTS[Math.floor(Math.random() * SHIRTS.length)]),
-    pants: opts.cop ? '#1d2733' : PANTS[Math.floor(Math.random() * PANTS.length)],
-    name: opts.name || null, cashDrop: opts.cashDrop ?? (5 + Math.floor(Math.random() * 22)),
+    id: nextId++, kind: 'car', type, x, y, angle,
+    speed: 0, steer: 0, color, role,
+    w: spec.w, h: spec.h, hp: spec.hp, maxHp: spec.hp,
+    driver: null, passenger: null,
+    ai: null, dead: false, smokeT: 0, hornT: 0,
+    radius: Math.round(spec.w * 0.36),
   };
 }
 
-export function hurtPed(state, ped, amount, fromAngle, byPlayer) {
-  if (ped.dead) return;
-  ped.hp -= amount;
-  spawnParticles(state, 'hitpuff', ped.x, ped.y, 5);
-  if (state.audio && byPlayer) state.audio.hit();
-  if (ped.hp <= 0) {
-    ped.dead = true; ped.fadeT = 25;
-    dropCash(state, ped.x, ped.y, ped.cashDrop);
-    if (byPlayer) {
-      if (ped.cop) state.events.push({ kind: 'crime', crime: 'killCop', x: ped.x, y: ped.y, certain: true });
-      else state.events.push({ kind: 'crime', crime: ped.hostile ? 'gunfire' : 'killPed', x: ped.x, y: ped.y });
-    }
-  } else if (ped.cop && byPlayer) {
-    // laying a hand on an officer is always radioed in
-    state.events.push({ kind: 'crime', crime: 'hitCop', x: ped.x, y: ped.y, certain: true });
-  }
-  if (ped.hp > 0) {
-    ped.downT = Math.max(ped.downT, 1.6);
-    if (!ped.cop) { // officers get back up and come for you; civilians run
-      ped.fleeFrom = { x: ped.x - Math.cos(fromAngle) * 100, y: ped.y - Math.sin(fromAngle) * 100 };
-      ped.fleeT = 3;
-    }
-  }
+export function createBoat(type, x, y, angle, color, role) {
+  const spec = BOAT_TYPES[type];
+  return {
+    id: nextId++, kind: 'boat', type, x, y, angle,
+    speed: 0, steer: 0, color, role,
+    w: spec.w, h: spec.h, hp: spec.hp, maxHp: spec.hp,
+    driver: null, wakeT: 0, dead: false,
+    radius: Math.round(spec.w * 0.36),
+  };
 }
 
-const WALKABLE = new Set([T.SIDEWALK, T.PLAZA, T.PARK, T.SAND, T.DOCK, T.LOT, T.BRIDGE, T.GRASS]);
-export function updatePeds(state, dt) {
-  const city = state.city, player = state.player;
-  for (const p of state.peds) {
-    if (p.dead) { p.fadeT -= dt; continue; }
-    if (p.downT > 0) { p.downT -= dt; continue; }
-    let moveA = null, speed = 0;
-
-    if (p.cop) {
-      // A beat officer: ambles around his post, but the moment there is a
-      // wanted man on foot in sight he gives chase — and if he gets an
-      // elbow on him, the bust meter (police.js) does the rest. He does
-      // not chase cars or boats; the cruisers and the patrol boat exist
-      // for that.
-      const d = Math.hypot(player.x - p.x, player.y - p.y);
-      const hunting = state.wanted.stars > 0 && !player.inCar && !player.inBoat && d < 360;
-      if (hunting) {
-        if (d > 30) { moveA = Math.atan2(player.y - p.y, player.x - p.x); speed = 192; }
-        p.angle = angleLerp(p.angle, Math.atan2(player.y - p.y, player.x - p.x), dt * 9);
-      } else {
-        if (!p.target || Math.hypot(p.target.x - p.x, p.target.y - p.y) < 12) {
-          p.waitT -= dt;
-          if (p.waitT <= 0) {
-            p.waitT = Math.random() * 2;
-            const home = p.beat || p;
-            for (let tries = 0; tries < 8; tries++) {
-              const tx = Math.floor(home.x / TILE) + Math.floor((Math.random() - 0.5) * 10);
-              const ty = Math.floor(home.y / TILE) + Math.floor((Math.random() - 0.5) * 10);
-              if (WALKABLE.has(city.tileAt(tx, ty))) { p.target = { x: tx * TILE + 16, y: ty * TILE + 16 }; break; }
-            }
-          }
-        }
-        if (p.target && p.waitT <= 0) {
-          moveA = Math.atan2(p.target.y - p.y, p.target.x - p.x);
-          speed = 56;
-          p.angle = angleLerp(p.angle, moveA, dt * 6);
-        }
-      }
-    } else if (p.hostile) {
-      const d = Math.hypot(player.x - p.x, player.y - p.y);
-      const targetD = (player.inCar || player.inBoat) ? 210 : 165;
-      if (d > targetD + 40) { moveA = Math.atan2(player.y - p.y, player.x - p.x); speed = 120; }
-      else if (d < targetD - 60) { moveA = Math.atan2(p.y - player.y, p.x - player.x); speed = 95; }
-      else { moveA = Math.atan2(player.y - p.y, player.x - p.x) + Math.PI / 2; speed = 42; }
-      p.angle = angleLerp(p.angle, Math.atan2(player.y - p.y, player.x - p.x), dt * 8);
-      p.fireT -= dt;
-      if (d < 400 && p.fireT <= 0 && p.weapon) {
-        p.fireT = 0.55 + Math.random() * 0.5;
-        const aim = Math.atan2(player.y - p.y, player.x - p.x) + (Math.random() - 0.5) * 0.13;
-        spawnBullet(state, p.x, p.y, aim, p.weapon, true);
-        if (state.audio && d < 500) state.audio.shot('pistol');
-      }
-    } else if (p.fleeT > 0 && p.fleeFrom) {
-      p.fleeT -= dt;
-      moveA = Math.atan2(p.y - p.fleeFrom.y, p.x - p.fleeFrom.x);
-      speed = 168;
-      p.angle = angleLerp(p.angle, moveA, dt * 10);
-    } else {
-      // stroll: pick walkable targets nearby, amble between them
-      if (!p.target || Math.hypot(p.target.x - p.x, p.target.y - p.y) < 12) {
-        p.waitT -= dt;
-        if (p.waitT <= 0) {
-          p.waitT = Math.random() * 2.5;
-          for (let tries = 0; tries < 8; tries++) {
-            const tx = Math.floor(p.x / TILE) + Math.floor((Math.random() - 0.5) * 16);
-            const ty = Math.floor(p.y / TILE) + Math.floor((Math.random() - 0.5) * 16);
-            if (WALKABLE.has(city.tileAt(tx, ty))) { p.target = { x: tx * TILE + 16, y: ty * TILE + 16 }; break; }
-          }
-        }
-      }
-      if (p.target && p.waitT <= 0) {
-        moveA = Math.atan2(p.target.y - p.y, p.target.x - p.x);
-        speed = 52;
-        p.angle = angleLerp(p.angle, moveA, dt * 6);
-      }
-    }
-    if (moveA !== null && speed > 0) {
-      moveCircle(city, p, 9, p.x + Math.cos(moveA) * speed * dt, p.y + Math.sin(moveA) * speed * dt);
-    }
-    // threat reaction: nearby gunfire or a crash sends walkers running
-    const threat = state.lastThreat;
-    if (!p.hostile && !p.cop && threat && state.time - threat.t < 0.4 && dist2(p.x, p.y, threat.x, threat.y) < 240 * 240) {
-      p.fleeFrom = { x: threat.x, y: threat.y }; p.fleeT = 2 + Math.random() * 2;
+/** The nearest enterable vehicle (car with a free driver seat, or moored boat) to a point. */
+export function nearestVehicle(state, x, y, r) {
+  let best = null;
+  let bestD = r;
+  for (const list of [state.cars, state.boats]) {
+    for (const v of list) {
+      if (v.dead || v.driver) continue;
+      if (v.kind === 'car' && (v.role === 'cop' || v.role === 'block')) continue;
+      const d = dist(x, y, v.x, v.y);
+      if (d < bestD) { bestD = d; best = v; }
     }
   }
-  state.peds = state.peds.filter((p) => !p.dead || p.fadeT > 0);
+  return best;
 }
 
-// --------------------------------------------------------------- bullets
-export function spawnBullet(state, x, y, angle, weaponDef, hostile) {
-  state.bullets.push({
-    x, y, vx: Math.cos(angle) * weaponDef.speed, vy: Math.sin(angle) * weaponDef.speed,
-    life: weaponDef.range / weaponDef.speed, damage: weaponDef.damage, hostile, dead: false,
-  });
-  spawnParticles(state, 'muzzle', x + Math.cos(angle) * 14, y + Math.sin(angle) * 14, 2);
+// ---------------------------------------------------------------------------
+// Particles and skids
+
+export function addParticle(state, p) {
+  if (state.particles.length >= CAPS.particles) state.particles.shift();
+  state.particles.push(p);
 }
 
-export function updateBullets(state, dt) {
-  const city = state.city, player = state.player;
-  for (const b of state.bullets) {
-    if (b.dead) continue;
-    b.life -= dt;
-    if (b.life <= 0) { b.dead = true; continue; }
-    const nx = b.x + b.vx * dt, ny = b.y + b.vy * dt;
-    // rounds fly OVER open water (that is where the boats live); on land
-    // they still die on anything solid
-    const overWater = city.tileAtPx(nx, ny) === T.WATER;
-    if (!overWater && circleBlocked(city, nx, ny, 2)) {
-      spawnParticles(state, 'spark', nx, ny, 3);
-      b.dead = true; continue;
-    }
-    b.x = nx; b.y = ny;
-    if (b.hostile) {
-      const target = player.inCar ? state.playerCar() : (player.inBoat || player);
-      const r = (player.inCar || player.inBoat) ? target.def.h + 8 : 12;
-      if (target && dist2(b.x, b.y, target.x, target.y) < r * r) {
-        b.dead = true;
-        if (player.inCar) damageCar(state, target, b.damage * 0.4, 'bullet');
-        if (player.inBoat) damageBoat(state, target, b.damage * 0.4, 'bullet');
-        state.damagePlayer(b.damage, Math.atan2(b.vy, b.vx));
-      }
-    } else {
-      let consumed = false;
-      for (const p of state.peds) {
-        if (p.dead) continue;
-        if (dist2(b.x, b.y, p.x, p.y) < 13 * 13) {
-          hurtPed(state, p, b.damage, Math.atan2(b.vy, b.vx), true);
-          b.dead = true; consumed = true; break;
-        }
-      }
-      if (!consumed) for (const car of state.cars) {
-        if (car === state.playerCar()) continue;
-        if (dist2(b.x, b.y, car.x, car.y) < (car.def.h + 7) * (car.def.h + 7)) {
-          damageCar(state, car, b.damage, 'bullet');
-          spawnParticles(state, 'spark', b.x, b.y, 4);
-          if (car.kind === 'police') state.events.push({ kind: 'crime', crime: 'hitCop', x: car.x, y: car.y });
-          b.dead = true; consumed = true; break;
-        }
-      }
-      if (!consumed) for (const bt of state.boats) {
-        if (bt === player.inBoat || bt.dead) continue;
-        if (dist2(b.x, b.y, bt.x, bt.y) < (bt.def.h + 7) * (bt.def.h + 7)) {
-          damageBoat(state, bt, b.damage, 'bullet');
-          spawnParticles(state, 'splash', b.x, b.y, 4);
-          if (bt.kind === 'police') state.events.push({ kind: 'crime', crime: 'hitCop', x: bt.x, y: bt.y });
-          b.dead = true; break;
-        }
-      }
-    }
-  }
-  state.bullets = state.bullets.filter((b) => !b.dead);
-}
-
-// -------------------------------------------------- particles & pickups
-const PARTICLE_STYLE = {
-  spark:   { color: '#ffd23e', size: 2.4, life: 0.35, grav: 300, speed: 190 },
-  smoke:   { color: '#8b8f94', size: 5.5, life: 1.15, grav: -36, speed: 34 },
-  fire:    { color: '#ff7b2e', size: 4.6, life: 0.55, grav: -60, speed: 46 },
-  muzzle:  { color: '#ffca7a', size: 3.2, life: 0.07, grav: 0, speed: 26 },
-  cash:    { color: '#57e389', size: 2.6, life: 0.6, grav: 60, speed: 90 },
-  hitpuff: { color: '#c94f42', size: 3.4, life: 0.4, grav: 120, speed: 80 },
-  splash:  { color: '#7ec3ee', size: 3, life: 0.5, grav: 260, speed: 120 },
-  wake:    { color: '#dff2fb', size: 3.6, life: 0.95, grav: 0, speed: 20 },
-};
-export function spawnParticles(state, kind, x, y, n, spread = 1) {
-  const st = PARTICLE_STYLE[kind] || PARTICLE_STYLE.spark;
-  for (let i = 0; i < n; i++) {
-    if (state.particles.length >= MAX_PARTICLES) state.particles.shift();
-    const a = Math.random() * 6.283, sp = st.speed * (0.3 + Math.random() * 0.7) * spread;
-    state.particles.push({
-      x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 12,
-      life: st.life * (0.6 + Math.random() * 0.7), maxLife: st.life,
-      size: st.size * (0.7 + Math.random() * 0.6), color: st.color, grav: st.grav, kind,
+export function burst(state, x, y, kind, n, baseAngle = 0, spread = Math.PI * 2) {
+  const rng = state.rng;
+  for (let i = 0; i < n; i += 1) {
+    const a = baseAngle + rng.range(-spread / 2, spread / 2);
+    const sp = kind === 'spark' ? rng.range(60, 260) : kind === 'splash' ? rng.range(30, 130) : rng.range(14, 70);
+    addParticle(state, {
+      x, y,
+      vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
+      life: 0, maxLife: kind === 'smoke' ? rng.range(0.7, 1.5) : rng.range(0.25, 0.6),
+      size: kind === 'smoke' ? rng.range(5, 10) : kind === 'splash' ? rng.range(2, 4) : rng.range(1.5, 3),
+      kind,
+      color: kind === 'blood' ? '#a02723' : kind === 'splash' ? '#bfe6f2' : kind === 'smoke' ? '#555a60' : kind === 'dust' ? '#c9b083' : '#ffd76a',
     });
   }
 }
+
 export function updateParticles(state, dt) {
-  for (const p of state.particles) {
-    p.life -= dt;
-    p.x += p.vx * dt; p.y += p.vy * dt;
-    p.vy += p.grav * dt; p.vx *= (1 - 1.6 * dt); p.vy *= (1 - 0.4 * dt);
+  const list = state.particles;
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    const p = list[i];
+    p.life += dt;
+    if (p.life >= p.maxLife) { list.splice(i, 1); continue; }
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.vx *= (1 - 1.8 * dt);
+    p.vy *= (1 - 1.8 * dt);
+    if (p.kind === 'smoke') { p.vy -= 26 * dt; p.size += 7 * dt; }
+    if (p.kind === 'splash') p.vy += 300 * dt;
   }
-  state.particles = state.particles.filter((p) => p.life > 0);
-  for (const s of state.skids) s.life -= dt;
-  state.skids = state.skids.filter((s) => s.life > 0);
+  const skids = state.skids;
+  for (let i = skids.length - 1; i >= 0; i -= 1) {
+    skids[i].life -= dt;
+    if (skids[i].life <= 0) skids.splice(i, 1);
+  }
 }
 
-export function dropCash(state, x, y, amount) {
-  if (amount <= 0) return;
-  state.pickups.push({ kind: 'cash', x: x + (Math.random() - 0.5) * 16, y: y + (Math.random() - 0.5) * 16, amount, phase: Math.random() * 6.28 });
-  spawnParticles(state, 'cash', x, y, 5);
+export function addSkid(state, x, y) {
+  if (state.skids.length >= CAPS.skids) state.skids.shift();
+  state.skids.push({ x, y, life: 5 });
 }
-export function updatePickups(state, dt) {
-  const player = state.player;
-  const r = player.inCar ? 40 : 26;
-  for (const pk of state.pickups) {
-    pk.phase += dt * 4;
-    if (dist2(pk.x, pk.y, player.x, player.y) < r * r) {
-      pk.taken = true;
-      if (pk.kind === 'cash') {
-        player.cash += pk.amount;
-        if (state.audio) state.audio.cash();
-        state.floaters.push({ x: pk.x, y: pk.y - 14, text: '+$' + pk.amount, life: 1.1, color: '#57e389' });
+
+// ---------------------------------------------------------------------------
+// Damage
+
+/** Hurt the player (or the vehicle he is driving, which soaks hits first). */
+export function damagePlayer(state, dmg) {
+  const p = state.player;
+  if (p.dead) return;
+  if (state.vehicle) { damageVehicle(state, state.vehicle, dmg, false); return; }
+  let rest = dmg;
+  if (state.armor > 0) {
+    const absorbed = Math.min(state.armor, dmg * ARMOR_ABSORB);
+    state.armor -= absorbed;
+    rest = dmg - absorbed;
+  }
+  p.hp -= rest;
+  state.audio?.sfx('hurt');
+  if (p.hp <= 0) { p.hp = 0; p.dead = true; }
+}
+
+export function damagePed(state, ped, dmg, byPlayer) {
+  if (ped.dead) return;
+  ped.hp -= dmg;
+  burst(state, ped.x, ped.y, 'blood', 3);
+  if (ped.hp <= 0) {
+    ped.dead = true;
+    ped.deathT = 0;
+    if (byPlayer) {
+      state.crimes.push({ kind: ped.role === 'cop' ? 'copkill' : 'kill', x: ped.x, y: ped.y });
+      if (ped.role === 'civ') state.flags.civKilled = true;
+    }
+  } else if (ped.role === 'civ') {
+    ped.state = 'flee';
+    ped.fleeT = 3;
+    ped.fleeX = ped.x * 2 - state.player.x;
+    ped.fleeY = ped.y * 2 - state.player.y;
+  }
+}
+
+export function damageVehicle(state, veh, dmg, byPlayer) {
+  if (veh.dead) return;
+  veh.hp -= dmg;
+  if (veh.hp <= 0) {
+    veh.hp = 0;
+    veh.dead = true;
+    burst(state, veh.x, veh.y, 'smoke', 14);
+    burst(state, veh.x, veh.y, 'spark', 10);
+    state.audio?.sfx('crash', { vol: 0.9 });
+    if (state.vehicle === veh) {
+      // The player's ride burns around him: he bails out hurt but alive.
+      state.vehicle = null;
+      veh.driver = null;
+      state.player.hp = Math.max(10, state.player.hp - 22);
+      state.player.x = veh.x + veh.radius + 16;
+      state.player.y = veh.y;
+      if (veh.kind === 'boat') {
+        // Swimming is not a thing: wash ashore at the nearest dry tile.
+        let best = null;
+        let bestD = Infinity;
+        for (let r = 1; r <= 10 && !best; r += 1) {
+          for (let dy = -r; dy <= r; dy += 1) {
+            for (let dx = -r; dx <= r; dx += 1) {
+              const tx = Math.floor(veh.x / TILE) + dx;
+              const ty = Math.floor(veh.y / TILE) + dy;
+              const t = state.city.tileAt(tx, ty);
+              if (t !== T.WATER && t !== T.BUILDING) {
+                const px = tx * TILE + TILE / 2;
+                const py = ty * TILE + TILE / 2;
+                const d = (px - veh.x) ** 2 + (py - veh.y) ** 2;
+                if (d < bestD) { bestD = d; best = { x: px, y: py }; }
+              }
+            }
+          }
+        }
+        if (best) { state.player.x = best.x; state.player.y = best.y; }
       }
     }
   }
-  state.pickups = state.pickups.filter((pk) => !pk.taken);
+}
+
+// ---------------------------------------------------------------------------
+// Shooting
+
+/**
+ * Fire `actor`'s weapon toward `angle`. Actor is the player (uses state.weapon and
+ * state.ammo) or a ped (ped.weapon, infinite ammo). Returns true if a shot went off.
+ */
+export function fireWeapon(state, actor, angle) {
+  const isPlayer = actor === state.player;
+  const key = isPlayer ? state.weapon : (actor.weapon || 'pistol');
+  const spec = WEAPONS[key];
+  if (!spec) return false;
+  if (spec.melee) {
+    // A swing: anything hostile-sized in a short arc takes the hit.
+    const targets = state.peds;
+    for (const ped of targets) {
+      if (ped.dead) continue;
+      const d = dist(actor.x, actor.y, ped.x, ped.y);
+      if (d <= spec.range + ped.radius && Math.abs(angleDiff(angle, Math.atan2(ped.y - actor.y, ped.x - actor.x))) < 0.9) {
+        if (isPlayer) damagePed(state, ped, spec.dmg, true);
+        else if (ped === state.player) damagePlayer(state, spec.dmg);
+      }
+    }
+    if (isPlayer) {
+      for (const car of state.cars) {
+        if (!car.dead && dist(actor.x, actor.y, car.x, car.y) < spec.range + car.radius) damageVehicle(state, car, spec.dmg / 2, true);
+      }
+    }
+    state.audio?.sfx('punch', { vol: 0.5 });
+    return true;
+  }
+  if (isPlayer) {
+    if ((state.ammo[key] || 0) <= 0) { state.audio?.sfx('error', { vol: 0.3 }); return false; }
+    state.ammo[key] -= 1;
+  }
+  if (state.bullets.length < CAPS.bullets) {
+    for (let i = 0; i < spec.pellets; i += 1) {
+      const a = angle + state.rng.range(-spec.spread, spec.spread);
+      state.bullets.push({
+        x: actor.x + Math.cos(angle) * 16, y: actor.y + Math.sin(angle) * 16,
+        vx: Math.cos(a) * spec.speed, vy: Math.sin(a) * spec.speed,
+        life: spec.range / spec.speed, dmg: spec.dmg,
+        from: isPlayer ? 'player' : actor.role === 'cop' ? 'cop' : 'hostile',
+        dead: false,
+      });
+    }
+  }
+  burst(state, actor.x + Math.cos(angle) * 20, actor.y + Math.sin(angle) * 20, 'spark', 2, angle, 0.7);
+  state.audio?.sfx(`shot-${key}`, { vol: isPlayer ? 0.8 : 0.45 });
+  if (isPlayer) state.crimes.push({ kind: 'shot', x: actor.x, y: actor.y });
+  return true;
+}
+
+function bulletHitsSolid(state, b) {
+  const t = state.city.tileAtPx(b.x, b.y);
+  if (t === T.BUILDING) return true;
+  const solids = state.city.querySolids(b.x, b.y, 4, solidScratch);
+  for (const s of solids) {
+    if (b.x >= s.x && b.x <= s.x + s.w && b.y >= s.y && b.y <= s.y + s.h) return true;
+  }
+  return false;
+}
+
+export function updateBullets(state, dt) {
+  const list = state.bullets;
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    const b = list[i];
+    b.life -= dt;
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+    let kill = b.life <= 0;
+    if (!kill && bulletHitsSolid(state, b)) {
+      burst(state, b.x, b.y, 'spark', 2);
+      kill = true;
+    }
+    if (!kill && b.from !== 'player') {
+      // Enemy fire: hits the player's vehicle first, else the player.
+      const target = state.vehicle || state.player;
+      if (!state.player.dead && dist(b.x, b.y, target.x, target.y) < (target.radius || 13) + 3) {
+        if (state.vehicle) damageVehicle(state, state.vehicle, b.dmg, false);
+        else damagePlayer(state, b.dmg);
+        kill = true;
+      }
+    }
+    if (!kill && b.from === 'player') {
+      for (const ped of state.peds) {
+        if (ped.dead) continue;
+        if (dist(b.x, b.y, ped.x, ped.y) < ped.radius + 3) { damagePed(state, ped, b.dmg, true); kill = true; break; }
+      }
+      if (!kill) {
+        for (const veh of [...state.cars, ...state.boats]) {
+          if (veh.dead || veh === state.vehicle) continue;
+          if (dist(b.x, b.y, veh.x, veh.y) < veh.radius + 3) { damageVehicle(state, veh, b.dmg, true); kill = true; break; }
+        }
+      }
+    }
+    if (!kill && b.from === 'hostile') {
+      for (const ped of state.peds) {
+        if (ped.dead || ped.role === 'hostile') continue;
+        if (dist(b.x, b.y, ped.x, ped.y) < ped.radius + 3) { damagePed(state, ped, b.dmg, false); kill = true; break; }
+      }
+    }
+    if (kill) list.splice(i, 1);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Player on foot
+
+export function updatePlayer(state, input, dt) {
+  const p = state.player;
+  if (p.dead || state.vehicle) return;
+  p.fireCd -= dt;
+  const mag = Math.hypot(input.mx, input.my);
+  p.moving = mag > 0.12;
+  if (p.moving) {
+    const speed = input.sprint ? PLAYER.sprintSpeed : PLAYER.walkSpeed;
+    const nx = input.mx / (mag > 1 ? mag : 1);
+    const ny = input.my / (mag > 1 ? mag : 1);
+    collideMove(state.city, p, nx * speed * dt, ny * speed * dt, p.radius, 'land');
+    p.walkPhase += dt * (input.sprint ? 11 : 8);
+    if (dist(input.aimX, input.aimY, p.x, p.y) > 26) {
+      p.angle = Math.atan2(input.aimY - p.y, input.aimX - p.x);
+    } else {
+      p.angle = Math.atan2(ny, nx);
+    }
+    p.stepT -= dt;
+    if (p.stepT <= 0) { p.stepT = input.sprint ? 0.28 : 0.38; state.audio?.sfx('step', { vol: 0.12 }); }
+  } else if (dist(input.aimX, input.aimY, p.x, p.y) > 26) {
+    p.angle = Math.atan2(input.aimY - p.y, input.aimX - p.x);
+  }
+  // Weapon selection by number key.
+  if (input.weaponSlot >= 1 && input.weaponSlot <= 5) {
+    const key = ['fists', 'pistol', 'smg', 'shotgun', 'rifle'][input.weaponSlot - 1];
+    if (key === 'fists' || state.weaponsOwned[key]) state.weapon = key;
+  }
+  // Firing: automatics hold, semi-automatics need a fresh press.
+  const spec = WEAPONS[state.weapon];
+  const wantFire = input.fire && !state.dialogue && !state.menu;
+  if (wantFire && p.fireCd <= 0) {
+    if (spec.auto || !p.fireLatch) {
+      if (fireWeapon(state, p, Math.atan2(input.aimY - p.y, input.aimX - p.x))) {
+        p.fireCd = spec.rate;
+        p.fireLatch = true;
+      } else {
+        p.fireCd = 0.22;
+      }
+    }
+  }
+  if (!input.fire) p.fireLatch = false;
+}
+
+// ---------------------------------------------------------------------------
+// Driving (cars and boats share the arcade model; the ground decides the rules)
+
+function driveVehicle(state, veh, input, dt, mode) {
+  const isBoat = veh.kind === 'boat';
+  const spec = isBoat ? BOAT_TYPES[veh.type] : CAR_TYPES[veh.type];
+  const tile = state.city.tileAtPx(veh.x, veh.y);
+  const factor = isBoat ? 1 : groundFactor(tile);
+  const throttle = -input.my; // my is screen-down: up (W) gives my=-1 → forward
+  const steerIn = input.mx;
+
+  if (throttle > 0.1) {
+    veh.speed += spec.accel * throttle * dt * (veh.speed < 0 ? 2.2 : 1);
+  } else if (throttle < -0.1) {
+    if (veh.speed > 12) veh.speed -= spec.accel * 1.7 * dt;
+    else veh.speed += spec.accel * 0.55 * throttle * dt;
+  }
+  const topSpeed = spec.top * factor * (veh.dead ? 0 : 1);
+  veh.speed = clamp(veh.speed, -spec.reverse, topSpeed);
+  // Drag and rolling resistance.
+  veh.speed -= veh.speed * (isBoat ? 0.55 : 0.35) * dt;
+  if (Math.abs(veh.speed) < 2 && Math.abs(throttle) < 0.1) veh.speed = 0;
+
+  const speedRatio = clamp(Math.abs(veh.speed) / 130, 0, 1);
+  veh.steer = lerp(veh.steer || 0, steerIn, 1 - Math.pow(0.0001, dt));
+  if (veh.speed !== 0) {
+    const dirSign = veh.speed >= 0 ? 1 : -1;
+    veh.angle += veh.steer * spec.grip * 0.42 * speedRatio * dirSign * dt * (input.handbrake ? 1.5 : 1);
+  }
+  const dx = Math.cos(veh.angle) * veh.speed * dt;
+  const dy = Math.sin(veh.angle) * veh.speed * dt;
+  const wasSpeed = Math.abs(veh.speed);
+  const hit = collideMove(state.city, veh, dx, dy, veh.radius, mode);
+  if (hit && wasSpeed > 120) {
+    const impact = wasSpeed;
+    damageVehicle(state, veh, impact * 0.045, false);
+    state.audio?.sfx('crash', { vol: clamp(impact / 420, 0.2, 1) });
+    burst(state, veh.x, veh.y, 'spark', 6);
+    state.crimes.push({ kind: 'crash', x: veh.x, y: veh.y });
+    veh.speed *= -0.18;
+  } else if (hit) {
+    veh.speed *= 0.4;
+  }
+  // Skid marks and dust/water feedback.
+  if (!isBoat && Math.abs(veh.steer) > 0.55 && Math.abs(veh.speed) > 200) {
+    addSkid(state, veh.x - Math.cos(veh.angle) * 14, veh.y - Math.sin(veh.angle) * 14);
+  }
+  if (!isBoat && factor < 0.7 && Math.abs(veh.speed) > 90) {
+    burst(state, veh.x, veh.y, 'dust', 1);
+  }
+  if (isBoat) {
+    veh.wakeT -= dt;
+    if (Math.abs(veh.speed) > 30 && veh.wakeT <= 0) {
+      veh.wakeT = 0.05;
+      addParticle(state, {
+        x: veh.x - Math.cos(veh.angle) * veh.w * 0.5, y: veh.y - Math.sin(veh.angle) * veh.w * 0.5,
+        vx: -Math.cos(veh.angle) * 20, vy: -Math.sin(veh.angle) * 20,
+        life: 0, maxLife: 0.8, size: 5, kind: 'splash', color: '#dff4fa',
+      });
+    }
+  }
+  // Running people over is a crime and a tragedy.
+  if (Math.abs(veh.speed) > 60) {
+    for (const ped of state.peds) {
+      if (ped.dead || ped.inCar) continue;
+      if (dist(veh.x, veh.y, ped.x, ped.y) < veh.radius + ped.radius - 2) {
+        damagePed(state, ped, Math.abs(veh.speed) * 0.16, state.vehicle === veh);
+        if (state.vehicle === veh) state.crimes.push({ kind: 'hitped', x: ped.x, y: ped.y });
+        burst(state, ped.x, ped.y, 'blood', 5);
+      }
+    }
+  }
+  if (veh.dead) veh.speed = 0;
+}
+
+export function updatePlayerVehicle(state, input, dt) {
+  const veh = state.vehicle;
+  if (!veh) return;
+  driveVehicle(state, veh, input, dt, veh.kind === 'boat' ? 'water' : 'land');
+  state.player.x = veh.x;
+  state.player.y = veh.y;
+  state.player.angle = veh.angle;
+  // Firing from the driver's seat (or the deck) is allowed, at a slower cadence.
+  state.player.fireCd -= dt;
+  const spec = WEAPONS[state.weapon];
+  if (input.fire && state.player.fireCd <= 0 && !state.dialogue && !state.menu) {
+    if (fireWeapon(state, state.player, Math.atan2(input.aimY - veh.y, input.aimX - veh.x))) {
+      state.player.fireCd = spec.rate * 1.4;
+    } else state.player.fireCd = 0.25;
+  }
+  if (input.weaponSlot >= 1 && input.weaponSlot <= 5) {
+    const key = ['fists', 'pistol', 'smg', 'shotgun', 'rifle'][input.weaponSlot - 1];
+    if (key === 'fists' || state.weaponsOwned[key]) state.weapon = key;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Traffic: cars follow the avenue graph, node to node, keeping right.
+
+let graphCache = null;
+
+function roadGraph(city) {
+  if (graphCache && graphCache.city === city) return graphCache.graph;
+  const nodes = new Map();
+  const key = (tx, ty) => `${tx},${ty}`;
+  const xs = [...city.avenuesX, ...city.islandAvenuesX];
+  const ys = [...city.avenuesY, ...city.islandAvenuesY];
+  for (const tx of xs) {
+    for (const ty of ys) {
+      const t = city.tileAt(tx, ty);
+      if (t === T.ROAD || t === T.BRIDGE) nodes.set(key(tx, ty), { tx, ty, x: tx * TILE + TILE / 2, y: ty * TILE + TILE / 2, next: [] });
+    }
+  }
+  const segmentClear = (x0, y0, x1, y1) => {
+    const steps = Math.max(Math.abs(x1 - x0), Math.abs(y1 - y0));
+    for (let i = 1; i < steps; i += 1) {
+      const tx = Math.round(x0 + (x1 - x0) * (i / steps));
+      const ty = Math.round(y0 + (y1 - y0) * (i / steps));
+      const t = city.tileAt(tx, ty);
+      if (t !== T.ROAD && t !== T.BRIDGE) return false;
+    }
+    return true;
+  };
+  for (const node of nodes.values()) {
+    for (const other of nodes.values()) {
+      if (other === node) continue;
+      if (other.tx !== node.tx && other.ty !== node.ty) continue;
+      // Only the nearest node in each of the four directions can be a neighbour.
+      const dx = Math.sign(other.tx - node.tx);
+      const dy = Math.sign(other.ty - node.ty);
+      const distTiles = Math.abs(other.tx - node.tx) + Math.abs(other.ty - node.ty);
+      const existing = node.next.find((n) => n.dx === dx && n.dy === dy);
+      if (existing && existing.distTiles <= distTiles) continue;
+      if (!segmentClear(node.tx, node.ty, other.tx, other.ty)) continue;
+      const entry = { key: key(other.tx, other.ty), dx, dy, distTiles };
+      if (existing) Object.assign(existing, entry);
+      else node.next.push(entry);
+    }
+  }
+  graphCache = { city, graph: nodes };
+  return nodes;
+}
+
+export function randomRoadNode(state, minD, maxD) {
+  const graph = roadGraph(state.city);
+  const nodes = [...graph.values()];
+  for (let i = 0; i < 10; i += 1) {
+    const node = state.rng.pick(nodes);
+    const d = dist(state.player.x, state.player.y, node.x, node.y);
+    if (d >= minD && d <= maxD) return node;
+  }
+  return null;
+}
+
+function lanePoint(node, fromNode) {
+  // Aim at the target node, offset to the right-hand lane of travel.
+  const dx = Math.sign(node.tx - fromNode.tx);
+  const dy = Math.sign(node.ty - fromNode.ty);
+  return { x: node.x - dy * 17, y: node.y + dx * 17, dx, dy };
+}
+
+export function updateTrafficCar(state, car, dt) {
+  const graph = roadGraph(state.city);
+  if (!car.ai) {
+    // Snap a fresh traffic car onto the graph.
+    let best = null;
+    let bestD = Infinity;
+    for (const node of graph.values()) {
+      const d = dist(car.x, car.y, node.x, node.y);
+      if (d < bestD) { bestD = d; best = node; }
+    }
+    if (!best || best.next.length === 0) { car.dead = true; return; }
+    const first = state.rng.pick(best.next);
+    car.ai = { at: best, targetKey: first.key, prevKey: null };
+  }
+  const target = graph.get(car.ai.targetKey);
+  if (!target) { car.ai = null; return; }
+  const aim = lanePoint(target, car.ai.at);
+  const toAim = Math.atan2(aim.y - car.y, aim.x - car.x);
+  car.angle = turnToward(car.angle, toAim, 2.4 * dt);
+  // Desired speed: cruise, slower for the turn-in, stopped by anything ahead.
+  let want = 215;
+  const aheadX = car.x + Math.cos(car.angle) * 58;
+  const aheadY = car.y + Math.sin(car.angle) * 58;
+  for (const other of state.cars) {
+    if (other === car || other.dead) continue;
+    if (dist(aheadX, aheadY, other.x, other.y) < other.radius + 16) { want = 0; break; }
+  }
+  if (want > 0 && state.vehicle && dist(aheadX, aheadY, state.vehicle.x, state.vehicle.y) < 44) want = 0;
+  if (want > 0 && !state.vehicle && !state.player.dead && dist(aheadX, aheadY, state.player.x, state.player.y) < 34) want = 0;
+  if (want > 0) {
+    for (const ped of state.peds) {
+      if (ped.dead || ped.inCar) continue;
+      if (dist(aheadX, aheadY, ped.x, ped.y) < 30) { want = 0; break; }
+    }
+  }
+  car.speed = lerp(car.speed, want, 1 - Math.pow(0.05, dt));
+  const dx = Math.cos(car.angle) * car.speed * dt;
+  const dy = Math.sin(car.angle) * car.speed * dt;
+  const hit = collideMove(state.city, car, dx, dy, car.radius, 'land');
+  if (hit) car.speed = Math.min(car.speed, 30);
+  if (dist(car.x, car.y, target.x, target.y) < 30) {
+    const options = target.next.filter((n) => n.key !== car.ai.prevKey);
+    const chosen = options.length > 0 ? state.rng.pick(options) : target.next[0];
+    if (!chosen) { car.speed = 0; return; }
+    car.ai = { at: target, targetKey: chosen.key, prevKey: `${target.tx},${target.ty}` };
+  }
+}
+
+export function updateTraffic(state, dt) {
+  for (const car of state.cars) {
+    if (car.role !== 'traffic' || car.dead) continue;
+    if (car === state.vehicle) continue;
+    updateTrafficCar(state, car, dt);
+  }
+}
+
+/** Soft car-to-car and car-to-boat separation with a little crunch. */
+export function resolveVehicleCollisions(state) {
+  const vehs = [...state.cars, ...state.boats];
+  for (let i = 0; i < vehs.length; i += 1) {
+    for (let j = i + 1; j < vehs.length; j += 1) {
+      const a = vehs[i];
+      const b = vehs[j];
+      if (a.dead || b.dead) continue;
+      if (a.kind !== b.kind) continue;
+      const d = dist(a.x, a.y, b.x, b.y);
+      const min = a.radius + b.radius - 4;
+      if (d <= 0 || d >= min) continue;
+      const push = (min - d) / 2;
+      const nx = (b.x - a.x) / d;
+      const ny = (b.y - a.y) / d;
+      const aMovable = state.vehicle !== a;
+      const bMovable = state.vehicle !== b;
+      if (aMovable) { a.x -= nx * push; a.y -= ny * push; }
+      if (bMovable) { b.x += nx * push; b.y += ny * push; }
+      const closing = Math.abs(a.speed - b.speed);
+      if (closing > 130) {
+        damageVehicle(state, a, closing * 0.03, state.vehicle === b);
+        damageVehicle(state, b, closing * 0.03, state.vehicle === a);
+        state.audio?.sfx('crash', { vol: 0.5 });
+        if (state.vehicle === a || state.vehicle === b) state.crimes.push({ kind: 'crash', x: a.x, y: a.y });
+      }
+      const avg = (a.speed + b.speed) / 2;
+      if (aMovable) a.speed = avg * 0.7;
+      if (bMovable) b.speed = avg * 0.7;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pedestrians
+
+export function lineBlocked(state, x0, y0, x1, y1) {
+  const steps = Math.ceil(dist(x0, y0, x1, y1) / 22);
+  for (let i = 1; i < steps; i += 1) {
+    const x = x0 + (x1 - x0) * (i / steps);
+    const y = y0 + (y1 - y0) * (i / steps);
+    if (state.city.tileAtPx(x, y) === T.BUILDING) return true;
+  }
+  return false;
+}
+
+function walkToward(state, ped, tx, ty, speed, dt) {
+  const d = dist(ped.x, ped.y, tx, ty);
+  if (d < 4) return true;
+  const a = Math.atan2(ty - ped.y, tx - ped.x);
+  ped.angle = turnToward(ped.angle, a, 8 * dt);
+  collideMove(state.city, ped, Math.cos(a) * speed * dt, Math.sin(a) * speed * dt, ped.radius, 'land');
+  ped.walkPhase += dt * (speed > 200 ? 12 : 8);
+  return d < 16;
+}
+
+export function updatePeds(state, dt) {
+  const p = state.player;
+  for (let i = state.peds.length - 1; i >= 0; i -= 1) {
+    const ped = state.peds[i];
+    if (ped.dead) {
+      ped.deathT += dt;
+      if (ped.deathT > 30) state.peds.splice(i, 1);
+      continue;
+    }
+    if (ped.inCar) continue;
+    if (ped.role === 'cop') continue; // police.js walks the beat
+    if (ped.role === 'contact') {
+      if (dist(ped.x, ped.y, p.x, p.y) < 220) ped.angle = Math.atan2(p.y - ped.y, p.x - ped.x);
+      continue;
+    }
+    if (ped.role === 'hostile') {
+      updateHostile(state, ped, dt);
+      continue;
+    }
+    // Civilian life: flee danger, otherwise wander the pavements.
+    if (state.lastShot && state.time - state.lastShot.t < 1.2 && dist(ped.x, ped.y, state.lastShot.x, state.lastShot.y) < 230) {
+      ped.state = 'flee';
+      ped.fleeT = Math.max(ped.fleeT, 2.2);
+      ped.fleeX = ped.x * 2 - state.lastShot.x;
+      ped.fleeY = ped.y * 2 - state.lastShot.y;
+    }
+    if (ped.state === 'flee') {
+      ped.fleeT -= dt;
+      walkToward(state, ped, ped.fleeX, ped.fleeY, 238, dt);
+      if (ped.fleeT <= 0) ped.state = 'wander';
+      continue;
+    }
+    if (ped.waitT > 0) {
+      ped.waitT -= dt;
+      continue;
+    }
+    if (walkToward(state, ped, ped.tx, ped.ty, 92, dt)) {
+      ped.waitT = state.rng.range(0.4, 3.2);
+      for (let tries = 0; tries < 6; tries += 1) {
+        const nx = ped.x + state.rng.range(-280, 280);
+        const ny = ped.y + state.rng.range(-280, 280);
+        if (isWalkableTile(state.city.tileAtPx(nx, ny))) { ped.tx = nx; ped.ty = ny; break; }
+      }
+    }
+  }
+}
+
+function updateHostile(state, ped, dt) {
+  const p = state.player;
+  const target = state.vehicle || p;
+  if (p.dead) return;
+  const d = dist(ped.x, ped.y, target.x, target.y);
+  const seen = d < 430 && !lineBlocked(state, ped.x, ped.y, target.x, target.y);
+  ped.fireCd -= dt;
+  if (!seen) {
+    if (d < 620) walkToward(state, ped, target.x, target.y, 150, dt);
+    return;
+  }
+  ped.angle = Math.atan2(target.y - ped.y, target.x - ped.x);
+  if (d > 280) walkToward(state, ped, target.x, target.y, 168, dt);
+  else if (d < 120) walkToward(state, ped, ped.x * 2 - target.x, ped.y * 2 - target.y, 150, dt);
+  else {
+    // Strafe slowly sideways while shooting.
+    const side = Math.sin(state.time * 0.7 + ped.id) > 0 ? 1 : -1;
+    collideMove(state.city, ped, Math.cos(ped.angle + Math.PI / 2) * side * 34 * dt, Math.sin(ped.angle + Math.PI / 2) * side * 34 * dt, ped.radius, 'land');
+  }
+  if (ped.fireCd <= 0 && d < 400) {
+    const aim = Math.atan2(target.y - ped.y, target.x - ped.x) + state.rng.range(-0.06, 0.06);
+    if (fireWeapon(state, ped, aim)) ped.fireCd = state.rng.range(0.55, 1.15);
+    else ped.fireCd = 0.4;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Ambient population
+
+const AMBIENT_TYPES = ['compact', 'compact', 'sedan', 'sedan', 'sedan', 'muscle', 'pickup', 'taxi'];
+
+export function maintainTraffic(state) {
+  const p = state.player;
+  for (let i = state.cars.length - 1; i >= 0; i -= 1) {
+    const car = state.cars[i];
+    if (car.role === 'traffic' && car !== state.vehicle && dist(p.x, p.y, car.x, car.y) > 1550) {
+      state.cars.splice(i, 1);
+    }
+  }
+  const live = state.cars.filter((c) => c.role === 'traffic' && !c.dead).length;
+  if (live >= CAPS.traffic) return;
+  const node = randomRoadNode(state, 580, 1180);
+  if (!node) return;
+  const type = state.rng.pick(AMBIENT_TYPES);
+  const car = createCar(
+    type, node.x, node.y, 0,
+    type === 'taxi' ? '#f2b21b' : state.rng.pick(['#c23b2e', '#2e6fc2', '#e0a51f', '#3f9e4d', '#e8e6df', '#565b63', '#7a3f8c', '#c26a1b', '#2b2e33', '#87b5c9']),
+    'traffic',
+  );
+  state.cars.push(car);
+}
+
+export function maintainPeds(state) {
+  const p = state.player;
+  for (let i = state.peds.length - 1; i >= 0; i -= 1) {
+    const ped = state.peds[i];
+    if (ped.role === 'civ' && dist(p.x, p.y, ped.x, ped.y) > 1050) state.peds.splice(i, 1);
+  }
+  const live = state.peds.filter((x) => x.role === 'civ' && !x.dead).length;
+  if (live >= CAPS.peds) return;
+  for (let tries = 0; tries < 6; tries += 1) {
+    const a = state.rng.range(0, Math.PI * 2);
+    const d = state.rng.range(360, 780);
+    const x = p.x + Math.cos(a) * d;
+    const y = p.y + Math.sin(a) * d;
+    const t = state.city.tileAtPx(x, y);
+    if (!isWalkableTile(t) || t === T.ROAD) continue;
+    state.peds.push(createPed(state.rng, x, y, 'civ'));
+    return;
+  }
 }

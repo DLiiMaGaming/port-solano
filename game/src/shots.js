@@ -1,184 +1,275 @@
-// PORT SOLANO — shots.js
-// Deterministic scenes behind the screenshots in screenshots/. Each one
-// poses the real game — real city, real traffic, real police — and drives
-// it through the scripted input stand-in (input.js), so a screenshot is a
-// genuine render of this code, never a mock-up.
-//
-//   ?shot=start  the title screen over the bay at golden hour
-//   ?shot=drive  morning traffic in Centro, player at the wheel
-//   ?shot=chase  a three-star pursuit on the harbour avenues
-//   ?shot=docks  the Almacén Pulpo shootout, staged on foot
-//   ?shot=boat   a three-star harbour chase: speedboat vs patrol boat
+// Screenshot scenes behind ?shot=start|drive|chase|docks|boat. Each scene builds a real
+// game state, poses the pieces honestly (traffic is placed in real lanes and given a
+// settle phase to join the flow before the staged car pulls away; the pursuit cruisers
+// and the patrol boat are driven by the real police AI from the first frame), then plays
+// the real simulation forward with scripted input. Same seed, same frame, every time.
 
-import { WEAPONS } from './config.js';
-import { createVehicle, createPed, createBoat } from './entities.js';
+import { STEP, TILE } from './config.js';
+import { createCar, createBoat, createPed, dist } from './entities.js';
 
-export const SHOT_NAMES = ['start', 'drive', 'chase', 'docks', 'boat'];
-
-export function setupShot(state, name) {
-  const city = state.city;
-  state.shotMode = name;
-  if (name === 'start') {
-    state.clock = 18.6; // golden hour over the bay
-    state.camera.x = city.spots.island.x - state.camera.w / 2;
-    state.camera.y = 218 * 32 - state.camera.h / 2;
-    return;
-  }
-  if (name === 'drive') {
-    state.clock = 10.4;
-    const car = createVehicle(city, 'sedan', 3780, (3 * 24 + 2) * 32 + 16, 0, { kind: 'traffic' });
-    state.cars.push(car);
-    enterCar(state, car);
-    // a living avenue: a queue of traffic ahead, oncoming cars in the
-    // westbound lane, a taxi, and a car crossing the avenue just ahead —
-    // enough of them staged on lane centres that the frame is busy from
-    // the first second, before ambient spawns even join in
-    const laneW = (3 * 24 + 1) * 32 + 16; // westbound lane centre
-    const ahead = createVehicle(city, 'compact', 4150, car.y, 0, { kind: 'traffic' });
-    const ahead2 = createVehicle(city, 'pickup', 4480, car.y, 0, { kind: 'traffic' });
-    const ahead3 = createVehicle(city, 'sedan', 4340, car.y, 0, { kind: 'traffic' });
-    const taxi = createVehicle(city, 'taxi', 4300, laneW, Math.PI, { kind: 'traffic' });
-    const oncoming = createVehicle(city, 'compact', 3930, laneW, Math.PI, { kind: 'traffic' });
-    const crossing = createVehicle(city, 'compact', (5 * 24 + 1) * 32 + 16, 2050, Math.PI / 2, { kind: 'traffic' });
-    for (const c of [ahead, ahead2, ahead3, taxi, oncoming, crossing]) { state.cars.push(c); }
-    return;
-  }
-  if (name === 'chase') {
-    state.clock = 18.2;
-    const laneW = (7 * 24 + 1) * 32 + 16; // westbound lane centre
-    const laneE = (7 * 24 + 2) * 32 + 16; // eastbound lane centre
-    const car = createVehicle(city, 'muscle', (8 * 24 + 2) * 32, laneW, Math.PI, { kind: 'traffic', color: '#9d0208' });
-    car.vx = -180;
-    car.hp = car.maxHp = 400; // posed tough, like the docks scene: the
-    // pack rams and shoots from 3 stars, and the flight must still be
-    // alive — not a smoking wreck — when the shutter falls
-    state.cars.push(car);
-    enterCar(state, car);
-    state.wanted.heat = 140; // three stars
-    // The pursuit starts already on top of him, on lane centres so the
-    // Patrulla AI holds formation instead of scattering: one cruiser
-    // alongside in the eastbound lane, two more on his tail — and the
-    // police system still tops the pack up to the 3-star count.
-    const staged = [
-      [car.x + 120, laneE, -185], // alongside, next lane
-      [car.x + 285, laneW, -190], // on his tail, his lane
-      [car.x + 365, laneE, -195], // on his tail, next lane
-    ];
-    for (const [cx, cy, cvx] of staged) {
-      const cop = createVehicle(city, 'cruiser', cx, cy, Math.PI, { kind: 'police' });
-      cop.vx = cvx;
-      state.cars.push(cop);
-    }
-    const civ = createVehicle(city, 'sedan', car.x - 760, laneW, Math.PI, { kind: 'traffic' });
-    state.cars.push(civ);
-    return;
-  }
-  if (name === 'boat') {
-    state.clock = 18.45; // golden hour on the harbour
-    // Take the moored speedboat off the El Puerto front (the first
-    // speedboat in the fleet the city moored at boot) and put the player
-    // at its helm in the basin's open water, already making way.
-    const boat = state.boats.find((b) => b.kind === 'moored' && b.type === 'speedboat');
-    boat.hp = boat.maxHp = 800; // posed tough, like the chase car: the
-    // patrol boat shoots from 3 stars, and the flight must still be
-    // afloat — not a smoking wreck — when the shutter falls
-    state.player.maxHp = 400; state.player.hp = 400; // same insurance
-    boat.x = 5980; boat.y = 7520; boat.angle = Math.PI;
-    enterBoat(state, boat);
-    boat.vx = -150;
-    state.wanted.heat = 140; // three stars
-    // The patrol boat, staged in the same basin: the harbour basins are
-    // sealed off from each other by the causeway decks, and the patrol's
-    // off-screen spawn ring (560–760px out) would land it behind one of
-    // those decks from anywhere in this basin, beached before it ever
-    // came into frame. So the scene places it the way police.js itself
-    // builds it — same hull, same Patrulla colours — a few lengths off
-    // the player's quarter, and from the first frame updatePoliceBoat
-    // has its helm: it runs the player down and shoots for real.
-    const patrol = createBoat(city, 'speedboat', 5620, 7440, 0, { kind: 'police', color: '#274268' });
-    state.boats.push(patrol);
-    return;
-  }
-  if (name === 'docks') {
-    state.clock = 9.1;
-    const at = city.spots.pulpoYard;
-    state.player.x = at.x - 150; state.player.y = at.y + 66;
-    state.player.angle = 0.3;
-    state.player.weapon = 'pistol';
-    state.player.ammo.pistol = 48;
-    state.player.owned.pistol = true;
-    state.player.maxHp = 400; state.player.hp = 400; // survive the whole shoot
-    for (let i = 0; i < 3; i++) {
-      const ped = createPed(at.x + 60 + i * 62, at.y - 30 + (i % 2) * 74,
-        { hostile: true, weapon: WEAPONS.pistol, hp: 55 });
-      state.peds.push(ped);
-    }
-    const truck = createVehicle(city, 'pickup', at.x + 30, at.y + 120, 0.5, { kind: 'parked' });
-    state.cars.push(truck);
-    state.banner = { title: 'Ruido en el Muelle', sub: 'Clear the yard at Almacén Pulpo', t: 999 };
-    // Pose the real mission, not just its banner: with 'Ruido en el
-    // Muelle' active and the staged crew registered as its hostiles,
-    // publishMarker keeps the HUD tracker on the same objective line
-    // ('Clear the yard at Almacén Pulpo') instead of mission 1's.
-    state.story.index = 3; // MISSIONS[3] = 'Ruido en el Muelle'
-    state.story.phase = 'active';
-    state.story.hostiles = state.peds.filter((p) => p.hostile);
-    return;
-  }
-}
-
-function enterCar(state, car) {
-  state.player.inCar = car;
-  state.player.x = car.x; state.player.y = car.y;
-  state.player.angle = car.angle;
-}
-
-function enterBoat(state, boat) {
-  state.player.inBoat = boat;
-  state.player.x = boat.x; state.player.y = boat.y;
-  state.player.angle = boat.angle;
-}
-
-// A tiny driver that holds keys and aims the mouse for the posed scenes.
-export function createShotDriver(state, name) {
-  const driver = {
-    input: { keys: new Set(), justPressed: new Set(), mouse: { x: 640, y: 340, down: false } },
-    update(t) {
-      const keys = driver.input.keys;
-      keys.clear();
-      if (name === 'drive' || name === 'chase' || name === 'boat') {
-        keys.add('KeyW');
-        if (name === 'drive') {
-          const weave = Math.sin(t * 0.7) > 0.55 ? 'KeyA' : (Math.sin(t * 0.7) < -0.55 ? 'KeyD' : null);
-          if (weave) keys.add(weave);
-        }
-        if (name === 'boat') {
-          // A held helm: in a sealed basin the only way to keep way on
-          // is to run a turning circle, so the speedboat circles with
-          // its wake up while the patrol boat cuts across after it.
-          keys.add('KeyA');
-        }
-        // The chase holds a straight line down the avenue. Any sustained
-        // steering swings the fleeing car off the road and into the
-        // blocks, where the pack pins it against the kerb and shoots it
-        // dead before the shutter falls — the flight has to stay a
-        // flight: full throttle west, the Patrulla doing the moving.
-        driver.input.mouse.x = 700; driver.input.mouse.y = 330;
-      } else if (name === 'docks') {
-        // aim at the nearest living hostile and fire in bursts
-        let best = null, bd = Infinity;
-        for (const p of state.peds) {
-          if (!p.hostile || p.dead) continue;
-          const d = (p.x - state.player.x) ** 2 + (p.y - state.player.y) ** 2;
-          if (d < bd) { bd = d; best = p; }
-        }
-        if (best) {
-          driver.input.mouse.x = best.x - state.camera.x;
-          driver.input.mouse.y = best.y - state.camera.y;
-          driver.input.mouse.down = (t % 1.4) < 0.5;
-        }
-      }
-    },
+function idleInput() {
+  return {
+    mx: 0, my: 0, aimX: 0, aimY: 0, fire: false, sprint: false, handbrake: false,
+    interact: false, confirm: false, pause: false, weaponSlot: 0,
+    radioNext: false, radioPrev: false, mute: false,
   };
-  return driver;
+}
+
+function enterVehicle(state, veh) {
+  veh.driver = state.player;
+  state.vehicle = veh;
+  state.player.x = veh.x;
+  state.player.y = veh.y;
+}
+
+/**
+ * Point a freshly placed traffic car along its avenue: pre-seed the route the traffic
+ * AI would build when the car joins the road graph (same shape, real target node), so
+ * it drives off in its own lane. Left to itself the AI picks its first target at
+ * random from the nearest junction — and a car staged "ahead, same lane" can U-turn
+ * across the whole avenue and wedge on a parked car behind the camera.
+ */
+function routeAlong(car, atTx, atTy, targetKey, prevKey) {
+  car.ai = {
+    at: { tx: atTx, ty: atTy, x: atTx * TILE + TILE / 2, y: atTy * TILE + TILE / 2, next: [] },
+    targetKey,
+    prevKey,
+  };
+}
+
+/**
+ * A scripted driver for the staged scenes: full throttle up to `cap` px/s, coast above
+ * it, and brake for a slower vehicle ahead in the same lane — the judgement a real
+ * player would use, so the staged car flows with traffic instead of ploughing into it.
+ */
+function cruiseInput(cap) {
+  const input = idleInput();
+  return (s) => {
+    const veh = s.vehicle;
+    input.mx = 0;
+    input.my = 0;
+    if (!veh) return input;
+    const fx = Math.cos(veh.angle);
+    const fy = Math.sin(veh.angle);
+    input.aimX = veh.x + fx * 220;
+    input.aimY = veh.y + fy * 220;
+    let obstacleGap = Infinity;
+    let obstacleSpeed = 0;
+    let brakeAt = 95;
+    let coastAt = 190;
+    for (const other of s.cars) {
+      if (other === veh || other.dead) continue;
+      const rx = other.x - veh.x;
+      const ry = other.y - veh.y;
+      const ahead = rx * fx + ry * fy;
+      const side = Math.abs(rx * -fy + ry * fx);
+      if (ahead > 0 && ahead < obstacleGap && side < 30) { obstacleGap = ahead; obstacleSpeed = other.speed; }
+    }
+    // A pedestrian in the lane band counts too, but only at the traffic AI's own
+    // judgement distance: the script brakes for jaywalkers instead of running them
+    // down (which also kept a stray wanted star out of the drive scene and a heat
+    // spike out of the chase), yet a walker 150 px away is still just crossing —
+    // braking for him from that far froze the drive scene behind a man strolling
+    // along the lane.
+    for (const ped of s.peds) {
+      if (ped.dead || ped.inCar) continue;
+      const rx = ped.x - veh.x;
+      const ry = ped.y - veh.y;
+      const ahead = rx * fx + ry * fy;
+      const side = Math.abs(rx * -fy + ry * fx);
+      if (ahead > 0 && ahead < obstacleGap && side < 24) { obstacleGap = ahead; obstacleSpeed = 0; brakeAt = 70; coastAt = 110; }
+    }
+    if (obstacleGap < coastAt && obstacleSpeed < veh.speed - 12) {
+      // Closing on something slower: brake when close, otherwise just lift off.
+      input.my = obstacleGap < brakeAt ? 0.55 : 0;
+    } else if (veh.speed < cap) {
+      input.my = -1;
+    }
+    return input;
+  };
+}
+
+function stageStart(state) {
+  state.tod = 18 * 60 + 12; // golden hour over the bay
+  const spot = state.city.spots.marisol;
+  state.player.x = spot.x + 30;
+  state.player.y = spot.y + 10;
+  state.player.angle = 0.4;
+  const sedan = createCar('sedan', spot.x + 90, spot.y + 66, 0.2, '#2e6fc2', 'parked');
+  state.cars.push(sedan);
+  return { seconds: 2.5, input: () => idleInput(), screen: 'title' };
+}
+
+function stageDrive(state) {
+  state.tod = 10 * 60 + 30;
+  // Eastbound on the avenue at ty 94 through Centro. The avenue choice is load-bearing
+  // twice over: this lane carries no parked cars at all (on ty 126 a parked taxi stops
+  // the whole lane and the old staging rear-ended the queue at full speed), and the
+  // camera's 720 px window over ty 94 contains none of the traffic graph's dead-end
+  // phantom nodes (the mainland-X × island-Y crossings at ty 114/130/146/162, where
+  // ambient spawns are marked dead on arrival and sit in frame as stacked wrecks).
+  const car = createCar('sedan', 1700, 94 * 32 + 33, 0, '#c23b2e', 'traffic');
+  state.cars.push(car);
+  enterVehicle(state, car);
+  // Neighbours in the correct lanes and headings: one behind in the same lane, one
+  // ahead, one coming the other way. A settle phase (below) lets them join the traffic
+  // graph's flow before the staged car pulls away, so nobody is mid-U-turn in frame.
+  const behind = createCar('compact', 1545, 94 * 32 + 33, 0, '#565b63', 'traffic');
+  routeAlong(behind, 46, 94, '62,94', '46,94');
+  state.cars.push(behind);
+  const ahead = createCar('sedan', 2020, 94 * 32 + 33, 0, '#87b5c9', 'traffic');
+  routeAlong(ahead, 62, 94, '78,94', '62,94');
+  state.cars.push(ahead);
+  const oncoming = createCar('sedan', 2400, 94 * 32 - 1, Math.PI, '#2e6fc2', 'traffic');
+  routeAlong(oncoming, 78, 94, '62,94', '78,94');
+  state.cars.push(oncoming);
+  for (let i = 0; i < 5; i += 1) {
+    const ped = createPed(state.rng, (54 + i * 5) * 32, 92 * 32 + 16, 'civ');
+    state.peds.push(ped);
+  }
+  for (let i = 0; i < 2; i += 1) {
+    const ped = createPed(state.rng, (60 + i * 6) * 32, 96 * 32 + 16, 'civ');
+    state.peds.push(ped);
+  }
+  const SETTLE = 5.5;
+  const cruise = cruiseInput(208); // a shade under traffic's own 215 cruise
+  return {
+    seconds: SETTLE + 2.8,
+    input: (s, t) => (t < SETTLE ? idleInput() : cruise(s)),
+    screen: 'play',
+  };
+}
+
+function stageChase(state) {
+  state.tod = 18 * 60 + 37; // dusk
+  // Westbound on the avenue at ty 142 out of El Puerto: the lane is free of parked cars
+  // for the whole run, and heading west puts 640 px of frame behind the car for the
+  // pursuit to fill. (The old staging ran south down tx 142 with a scripted swerve that
+  // steered the car into the Almacén Pulpo wall, and one staged cruiser spawned in a
+  // dumpster pocket off the avenue and never moved.)
+  // The start sits far enough west that the whole formation is on dry land — the
+  // avenue ends at the bay shore (x ~4864), and a cruiser staged past it spawns in
+  // the shallows and never moves.
+  const car = createCar('muscle', 4280, 142 * 32 - 1, Math.PI, '#2b2e33', 'traffic');
+  car.hp = car.maxHp;
+  state.cars.push(car);
+  enterVehicle(state, car);
+  // Exactly three stars: hot enough for cruiser gunfire, and the wanted model then
+  // wants exactly the three staged cruisers — no fourth spawns ahead of the player
+  // and drives into the chase head-on.
+  state.wanted.heat = 100;
+  // A cruiser formation on the tail, single file on open road, driven by the real
+  // pursuit AI. Single file matters: a cruiser staged in the next lane converged
+  // diagonally into its partner's path and the two rear-ended each other and stopped.
+  // The staggered fireCd spreads their gunfire over the run instead of a single
+  // volley that leaves the staged car barely alive at the capture moment.
+  const formation = [[160, 1.9], [310, 2.4], [450, 3.1]];
+  for (const [back, fireCd] of formation) {
+    const cop = createCar('cruiser', car.x + back, car.y, Math.PI, '#e9edf2', 'cop');
+    cop.fireCd = fireCd;
+    state.cars.push(cop);
+  }
+  // The muscle car is faster than a cruiser flat out, so the script caps it at 330:
+  // the pursuit closes up and presses on the tail instead of falling out of frame.
+  const cruise = cruiseInput(330);
+  return {
+    seconds: 3.3,
+    input: (s) => cruise(s),
+    screen: 'play',
+  };
+}
+
+function stageDocks(state) {
+  state.tod = 13 * 60;
+  const yard = state.city.spots.warehouse;
+  state.player.x = yard.x - 60;
+  state.player.y = yard.y + 130;
+  state.weaponsOwned.smg = true;
+  state.ammo.smg = 240;
+  state.weapon = 'smg';
+  state.armor = 100; // posed tough, like the chase scene's car: the frame must survive its own shootout
+  const points = [[90, 60], [150, 110], [40, 170], [190, 40]];
+  for (const [ox, oy] of points) {
+    const ped = createPed(state.rng, yard.x + ox, yard.y + oy, 'hostile', { weapon: 'pistol' });
+    state.peds.push(ped);
+  }
+  const input = idleInput();
+  return {
+    seconds: 2.6,
+    input: (s) => {
+      let best = null;
+      let bestD = Infinity;
+      for (const ped of s.peds) {
+        if (ped.dead || ped.role !== 'hostile') continue;
+        const d = dist(s.player.x, s.player.y, ped.x, ped.y);
+        if (d < bestD) { bestD = d; best = ped; }
+      }
+      if (best) {
+        input.aimX = best.x;
+        input.aimY = best.y;
+        input.fire = bestD < 380;
+        input.mx = 0.2;
+      }
+      return input;
+    },
+    screen: 'play',
+  };
+}
+
+function stageBoat(state) {
+  state.tod = 18 * 60 + 27; // golden hour on the water
+  const spot = state.city.spots.boatSpots[1];
+  // Board at the Puerto pier berth, then run NORTH along the waterfront: open bay ahead,
+  // the docks and city shore to port, wake streaming astern. (The old course pointed
+  // south-east and turned starboard — straight into the causeway deck, which is solid
+  // to boats, and wedged there at walking pace inside two seconds.)
+  const boat = createBoat('speedboat', spot.x + 90, spot.y, -Math.PI / 2, '#c23b2e', 'moored');
+  boat.hp = boat.maxHp;
+  state.boats.push(boat);
+  enterVehicle(state, boat);
+  state.wanted.heat = 74; // three stars: the patrol is out
+  // Staged in-basin astern of the player, already pointing the same way, and driven by
+  // the real police-boat AI. Same hull, same top speed: the gap holds and it stays in
+  // frame instead of ramming across the player's bow and tangling with the berth.
+  const patrol = createBoat('speedboat', spot.x + 180, spot.y + 280, -Math.PI / 2, '#274268', 'police');
+  patrol.fireCd = 1.8;
+  state.boats.push(patrol);
+  state.wanted.policeBoat = patrol;
+  const input = idleInput();
+  input.my = -1;
+  return {
+    seconds: 2.3,
+    input: (s) => {
+      input.aimX = s.player.x;
+      input.aimY = s.player.y - 200;
+      return input;
+    },
+    screen: 'play',
+  };
+}
+
+const SCENES = {
+  start: stageStart,
+  drive: stageDrive,
+  chase: stageChase,
+  docks: stageDocks,
+  boat: stageBoat,
+};
+
+/**
+ * Pose `state` as the named scene and play it forward. `stepGame` is passed in by
+ * main.js (the two modules would otherwise import each other). Returns the screen
+ * the page should show over the frame.
+ */
+export function stageShot(state, name, stepGame) {
+  const stage = SCENES[name] || stageStart;
+  state.story.index = 9; // no story marker/beacon in the frame
+  state.flags.noSave = true;
+  const scene = stage(state);
+  const steps = Math.round(scene.seconds / STEP);
+  for (let i = 0; i < steps; i += 1) {
+    stepGame(state, scene.input(state, i * STEP), STEP);
+    state.flags = {};
+  }
+  return { screen: scene.screen };
 }

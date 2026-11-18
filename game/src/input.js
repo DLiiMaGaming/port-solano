@@ -1,216 +1,164 @@
-// PORT SOLANO — input.js
-// Keyboard, mouse and gamepad state for the game. `keys` holds what is
-// down right now, `justPressed` holds what went down this frame (main.js
-// clears it at the end of every frame via postUpdate). Mouse position is
-// in canvas pixels; the game converts it to world space through the
-// camera.
+// Input: keyboard + mouse and a standard gamepad, merged into one per-frame sample the
+// simulation consumes. Held state (movement, fire, sprint) is read live; one-shot presses
+// (interact, pause, weapon slots, radio, mute) are queued as edges and delivered exactly
+// once by poll(), so a press between frames is never lost or doubled.
 //
-// A connected gamepad feeds the SAME state through pollGamepad (called
-// from postUpdate, once per frame): its buttons are translated into the
-// keyboard's key codes and its left stick into the movement keys, so
-// down()/pressed() answer for either device and the game code never
-// learns which one spoke. The right stick drives a virtual mouse cursor
-// for aiming, and the right trigger fires like the mouse button.
+// The sample shape (also what the headless harness fabricates):
+//   { mx, my }        movement axes in screen space, -1..1 (W/up is my=-1)
+//   { aimX, aimY }    world-space aim point
+//   fire, sprint, handbrake           held
+//   interact, confirm, pause          pressed this frame
+//   weaponSlot        0, or 1..5 when a number key / d-pad direction was pressed
+//   radioNext, radioPrev, mute        pressed this frame
 
-export const input = {
-  keys: new Set(),
-  justPressed: new Set(),
-  mouse: { x: 0, y: 0, down: false, rdown: false },
-  // The screenshot scenes drive the game through this stand-in instead of
-  // real devices; when it is set, the readers below consult it first.
-  scripted: null,
-  // Gamepad state, refreshed by pollGamepad at the end of every frame.
-  // keys/justPressed speak the keyboard's code language (see the button
-  // map below); move/aim are the dead-zoned sticks; mouse is the virtual
-  // cursor the right stick pushes around the canvas.
-  pad: {
-    connected: false,
-    id: '',
-    keys: new Set(),
-    justPressed: new Set(),
-    move: { x: 0, y: 0 },
-    aim: { x: 0, y: 0 },
-    mouse: { x: 0, y: 0 },
-    trigger: false,
-    // Set the first time the right stick is pushed; from then on
-    // mousePos() reports the pad cursor until the real mouse moves.
-    aimEngaged: false,
-  },
+const MOVE_KEYS = {
+  left: new Set(['ArrowLeft', 'KeyA']),
+  right: new Set(['ArrowRight', 'KeyD']),
+  up: new Set(['ArrowUp', 'KeyW']),
+  down: new Set(['ArrowDown', 'KeyS']),
 };
+const GAME_CODES = new Set([
+  ...MOVE_KEYS.left, ...MOVE_KEYS.right, ...MOVE_KEYS.up, ...MOVE_KEYS.down,
+  'Space', 'ShiftLeft', 'ShiftRight', 'KeyE', 'KeyP', 'Escape', 'KeyM', 'KeyR',
+  'BracketLeft', 'BracketRight', 'Digit1', 'Digit2', 'Digit3', 'Digit4', 'Digit5', 'Enter',
+]);
 
-let canvasRef = null;
-
-// Standard-mapping button index → the keyboard code it stands in for.
-// The set mirrors what the game already binds: E interacts and confirms,
-// Esc pauses, the digits select weapon slots, R and the brackets run
-// the radio, M mutes, Space is the handbrake (and on-foot fire).
-const PAD_BUTTON_CODES = {
-  0: 'KeyE',         // A / cross — interact, confirm dialogue
-  1: 'Escape',       // B / circle — back out, pause
-  2: 'KeyM',         // X / square — mute toggle
-  3: 'KeyR',         // Y / triangle — radio, next station
-  4: 'BracketLeft',  // LB — radio, previous station
-  5: 'Space',        // RB — handbrake / on-foot fire
-  9: 'Escape',       // start — pause
-  12: 'Digit1',      // d-pad up — weapon slot 1
-  13: 'Digit2',      // d-pad right — weapon slot 2
-  14: 'Digit3',      // d-pad down — weapon slot 3
-  15: 'Digit4',      // d-pad left — weapon slot 4
-};
-const PAD_TRIGGER_INDEX = 7; // RT — held down, it fires like the mouse
-const STICK_DEADZONE = 0.18;
-const STICK_PUSH = 0.4;      // stick deflection that counts as a held key
-const CURSOR_SPEED = 15;     // virtual-cursor pixels per frame at full tilt
-
-export function initInput(canvas) {
-  canvasRef = canvas;
-  input.pad.mouse.x = canvas.width / 2;
-  input.pad.mouse.y = canvas.height / 2;
-
-  window.addEventListener('keydown', (e) => {
-    if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(e.code)) {
-      e.preventDefault();
-    }
-    if (!e.repeat) input.justPressed.add(e.code);
-    input.keys.add(e.code);
-  });
-  window.addEventListener('keyup', (e) => input.keys.delete(e.code));
-  window.addEventListener('blur', () => { input.keys.clear(); input.mouse.down = false; });
-
-  const track = (e) => {
-    const rect = canvas.getBoundingClientRect();
-    input.mouse.x = (e.clientX - rect.left) * (canvas.width / rect.width);
-    input.mouse.y = (e.clientY - rect.top) * (canvas.height / rect.height);
-    input.pad.aimEngaged = false; // a real mouse move hands aiming back
+function zeroInput() {
+  return {
+    mx: 0, my: 0, aimX: 0, aimY: 0,
+    fire: false, sprint: false, handbrake: false,
+    interact: false, confirm: false, pause: false,
+    weaponSlot: 0, radioNext: false, radioPrev: false, mute: false,
   };
-  canvas.addEventListener('mousemove', track);
-  canvas.addEventListener('mousedown', (e) => {
-    track(e);
-    if (e.button === 0) input.mouse.down = true;
-    if (e.button === 2) input.mouse.rdown = true;
-  });
-  window.addEventListener('mouseup', (e) => {
-    if (e.button === 0) input.mouse.down = false;
-    if (e.button === 2) input.mouse.rdown = false;
-  });
-  canvas.addEventListener('contextmenu', (e) => e.preventDefault());
-
-  window.addEventListener('gamepadconnected', (e) => {
-    input.pad.connected = true;
-    input.pad.id = e.gamepad ? e.gamepad.id : '';
-  });
-  window.addEventListener('gamepaddisconnected', () => clearPad());
 }
 
-function clearPad() {
-  const pad = input.pad;
-  pad.connected = false;
-  pad.id = '';
-  pad.keys = new Set();
-  pad.justPressed = new Set();
-  pad.move.x = 0; pad.move.y = 0;
-  pad.aim.x = 0; pad.aim.y = 0;
-  pad.trigger = false;
-  pad.aimEngaged = false;
-}
-
-// The codes in `now` that were not in `prev` — this poll's fresh presses.
-function newlyDown(prev, now) {
-  const fresh = new Set();
-  for (const code of now) if (!prev.has(code)) fresh.add(code);
-  return fresh;
-}
-
-function deadAxis(v) {
-  return Math.abs(v) < STICK_DEADZONE ? 0 : v;
-}
-
-// Read the first connected gamepad into input.pad. Runs once per frame
-// from postUpdate, so the state the game reads during a frame is the
-// poll taken at the end of the previous one — the same one-frame rhythm
-// the keyboard's justPressed clearing already follows. Harmless where
-// the Gamepad API does not exist (headless runs, older browsers).
-export function pollGamepad() {
-  const pad = input.pad;
-  const nav = globalThis.navigator;
-  if (!nav || typeof nav.getGamepads !== 'function') {
-    if (pad.connected) clearPad();
-    return;
+export function createInput(canvas) {
+  if (typeof window === 'undefined' || !canvas) {
+    return { poll: () => zeroInput(), setTransform() {}, dispose() {} };
   }
-  let gp = null;
-  for (const candidate of nav.getGamepads()) {
-    if (candidate && candidate.connected) { gp = candidate; break; }
+
+  const held = new Set();
+  let edges = zeroInput();
+  let mouseX = 0;
+  let mouseY = 0;
+  let mouseDown = false;
+  let transform = null; // (clientX, clientY) -> {x, y} world
+  let padPrev = [];
+  let padAim = null; // {dx, dy} unit-ish from the right stick
+
+  function onKeyDown(event) {
+    if (!GAME_CODES.has(event.code)) return;
+    event.preventDefault();
+    if (event.repeat) return;
+    held.add(event.code);
+    if (event.code === 'KeyE') edges.interact = true;
+    else if (event.code === 'Space' || event.code === 'Enter') edges.confirm = true;
+    else if (event.code === 'KeyP' || event.code === 'Escape') edges.pause = true;
+    else if (event.code === 'KeyM') edges.mute = true;
+    else if (event.code === 'KeyR' || event.code === 'BracketRight') edges.radioNext = true;
+    else if (event.code === 'BracketLeft') edges.radioPrev = true;
+    else if (event.code.startsWith('Digit')) edges.weaponSlot = Number(event.code.slice(5));
   }
-  if (!gp) {
-    if (pad.connected) clearPad();
-    return;
+  function onKeyUp(event) {
+    held.delete(event.code);
   }
-  pad.connected = true;
-  pad.id = gp.id || '';
-
-  const axes = gp.axes || [];
-  pad.move.x = deadAxis(axes[0] || 0);
-  pad.move.y = deadAxis(axes[1] || 0);
-  pad.aim.x = deadAxis(axes[2] || 0);
-  pad.aim.y = deadAxis(axes[3] || 0);
-
-  const buttons = gp.buttons || [];
-  const nowDown = new Set();
-  for (const [index, code] of Object.entries(PAD_BUTTON_CODES)) {
-    const b = buttons[Number(index)];
-    if (b && (b.pressed || b.value > 0.4)) nowDown.add(code);
+  function onBlur() {
+    held.clear();
+    mouseDown = false;
   }
-  pad.justPressed = newlyDown(pad.keys, nowDown);
-  pad.keys = nowDown;
-  const trigger = buttons[PAD_TRIGGER_INDEX];
-  pad.trigger = !!(trigger && (trigger.pressed || trigger.value > 0.25));
-
-  // The right stick pushes the virtual cursor; once it has aimed,
-  // mousePos() reports the cursor until the real mouse moves again.
-  if (pad.aim.x !== 0 || pad.aim.y !== 0) {
-    pad.aimEngaged = true;
-    const w = canvasRef ? canvasRef.width : 1280;
-    const h = canvasRef ? canvasRef.height : 720;
-    pad.mouse.x = Math.min(w, Math.max(0, pad.mouse.x + pad.aim.x * CURSOR_SPEED));
-    pad.mouse.y = Math.min(h, Math.max(0, pad.mouse.y + pad.aim.y * CURSOR_SPEED));
+  function onPointerMove(event) {
+    mouseX = event.clientX;
+    mouseY = event.clientY;
+    padAim = null; // a moving mouse takes the aim back from the stick
   }
-}
+  function onPointerDown(event) {
+    mouseX = event.clientX;
+    mouseY = event.clientY;
+    if (event.button === 0) {
+      mouseDown = true;
+      edges.confirm = true;
+    }
+  }
+  function onPointerUp(event) {
+    if (event.button === 0) mouseDown = false;
+  }
 
-// Does the gamepad currently hold this code — as a mapped button, or as
-// the left stick pushed the way the movement keys would mean?
-function padHolds(code) {
-  const pad = input.pad;
-  if (pad.keys.has(code)) return true;
-  const m = pad.move;
-  if (m.y < -STICK_PUSH && (code === 'KeyW' || code === 'ArrowUp')) return true;
-  if (m.y > STICK_PUSH && (code === 'KeyS' || code === 'ArrowDown')) return true;
-  if (m.x < -STICK_PUSH && (code === 'KeyA' || code === 'ArrowLeft')) return true;
-  if (m.x > STICK_PUSH && (code === 'KeyD' || code === 'ArrowRight')) return true;
-  return false;
-}
+  window.addEventListener('keydown', onKeyDown);
+  window.addEventListener('keyup', onKeyUp);
+  window.addEventListener('blur', onBlur);
+  canvas.addEventListener('pointermove', onPointerMove);
+  canvas.addEventListener('pointerdown', onPointerDown);
+  window.addEventListener('pointerup', onPointerUp);
 
-export function down(...codes) {
-  if (input.scripted) return codes.some((c) => input.scripted.keys.has(c));
-  return codes.some((c) => input.keys.has(c)) || codes.some((c) => padHolds(c));
-}
+  function pollPad(sample) {
+    const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+    let pad = null;
+    for (const candidate of pads) if (candidate && candidate.connected) { pad = candidate; break; }
+    if (!pad) { padPrev = []; return; }
+    const dead = (v) => (Math.abs(v) < 0.16 ? 0 : v);
+    const lx = dead(pad.axes[0] || 0);
+    const ly = dead(pad.axes[1] || 0);
+    if (lx !== 0 || ly !== 0) { sample.mx = lx; sample.my = ly; }
+    const rx = dead(pad.axes[2] || 0);
+    const ry = dead(pad.axes[3] || 0);
+    if (rx !== 0 || ry !== 0) padAim = { dx: rx, dy: ry };
+    const pressed = (i) => !!(pad.buttons[i] && pad.buttons[i].pressed);
+    const edge = (i) => pressed(i) && !padPrev[i];
+    if (pressed(7)) sample.fire = true; // RT
+    if (pressed(5)) sample.handbrake = true; // RB
+    if (pressed(0)) sample.sprint = true; // A held = sprint on foot
+    if (edge(0)) { sample.interact = true; sample.confirm = true; }
+    if (edge(1) || edge(9)) sample.pause = true; // B / start
+    if (edge(3)) sample.radioNext = true; // Y
+    if (edge(4)) sample.radioPrev = true; // LB
+    if (edge(2)) sample.mute = true; // X
+    if (edge(12)) sample.weaponSlot = 1;
+    if (edge(15)) sample.weaponSlot = 2;
+    if (edge(13)) sample.weaponSlot = 3;
+    if (edge(14)) sample.weaponSlot = 4;
+    padPrev = pad.buttons.map((b) => !!b.pressed);
+  }
 
-export function pressed(...codes) {
-  if (input.scripted) return codes.some((c) => input.scripted.justPressed.has(c));
-  return codes.some((c) => input.justPressed.has(c)) || codes.some((c) => input.pad.justPressed.has(c));
-}
-
-export function mouseDown() {
-  if (input.scripted) return input.scripted.mouse.down;
-  return input.mouse.down || input.pad.trigger;
-}
-
-export function mousePos() {
-  if (input.scripted) return input.scripted.mouse;
-  return input.pad.aimEngaged ? input.pad.mouse : input.mouse;
-}
-
-export function postUpdate() {
-  input.justPressed.clear();
-  if (input.scripted) input.scripted.justPressed.clear();
-  pollGamepad();
+  return {
+    setTransform(fn) { transform = fn; },
+    poll(player) {
+      const sample = zeroInput();
+      sample.mx = (held.has('ArrowRight') || held.has('KeyD') ? 1 : 0) - (held.has('ArrowLeft') || held.has('KeyA') ? 1 : 0);
+      sample.my = (held.has('ArrowDown') || held.has('KeyS') ? 1 : 0) - (held.has('ArrowUp') || held.has('KeyW') ? 1 : 0);
+      sample.sprint = held.has('ShiftLeft') || held.has('ShiftRight');
+      sample.handbrake = held.has('Space');
+      sample.fire = mouseDown;
+      // Merge the queued edges exactly once.
+      sample.interact = edges.interact;
+      sample.confirm = edges.confirm || edges.interact;
+      sample.pause = edges.pause;
+      sample.weaponSlot = edges.weaponSlot;
+      sample.radioNext = edges.radioNext;
+      sample.radioPrev = edges.radioPrev;
+      sample.mute = edges.mute;
+      edges = zeroInput();
+      pollPad(sample);
+      // Aim: gamepad right stick wins while it is held; otherwise the mouse.
+      if (padAim && player) {
+        sample.aimX = player.x + padAim.dx * 230;
+        sample.aimY = player.y + padAim.dy * 230;
+      } else if (transform) {
+        const world = transform(mouseX, mouseY);
+        sample.aimX = world.x;
+        sample.aimY = world.y;
+      } else if (player) {
+        sample.aimX = player.x + 100;
+        sample.aimY = player.y;
+      }
+      return sample;
+    },
+    dispose() {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+      window.removeEventListener('blur', onBlur);
+      canvas.removeEventListener('pointermove', onPointerMove);
+      canvas.removeEventListener('pointerdown', onPointerDown);
+      window.removeEventListener('pointerup', onPointerUp);
+    },
+  };
 }

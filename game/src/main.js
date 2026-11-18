@@ -1,884 +1,768 @@
-// PORT SOLANO — main.js
-// The conductor: owns the game state, the frame loop, the player (on foot
-// and at the wheel), combat, shops, consequences (hospital, arrest), the
-// HUD, saving, and the title / pause flow. The simulation itself lives in
-// citygen.js (the city), entities.js (things that move), police.js (the
-// law), missions.js (the story and side work) and render.js (the eye).
+// PORT SOLANO — game state, the fixed-step simulation, interactions, shops, saving, and
+// (at the bottom, browser-only) the boot and HUD wiring. The simulation half is pure: it
+// imports no DOM API and runs under Node for the headless harness, which drives
+// createGame + stepGame with fabricated input objects.
+//
+// Flags contract: stepGame and the systems set one-shot notices on state.flags
+// (missionDone, taxiFare, starUp, ...). The browser layer reads them after each frame
+// and clears state.flags at the start of the next; the harness just reads them.
 
 import {
-  TILE, T, CITY_SEED, WEAPONS, WEAPON_ORDER, PRICES, SAVE_KEY,
-  DAY_LENGTH, START_CLOCK, MAX_PEDS, MAX_TRAFFIC, WORLD_PX,
+  STEP, MAX_FRAME, CLOCK, MONEY, WEAPONS, WEAPON_ORDER, AMMO_PACK, ARMOR_PRICE,
+  CAR_TYPES, BOAT_TYPES, CAR_COLORS, SAVE_KEY, DISTRICTS,
 } from './config.js';
-import { initInput, down, pressed, mouseDown, mousePos, postUpdate, input } from './input.js';
-import { AudioEngine } from './audio.js';
+import { createRandom } from './random.js';
 import { generateCity } from './citygen.js';
 import {
-  createVehicle, createPed, createBoat, stepVehicle, stepBoat, trafficControl, collideCars,
-  updatePeds, updateBoats, updateBullets, updateParticles, updatePickups, spawnBullet,
-  spawnParticles, hurtPed, damageCar, damageBoat, moveCircle, circleBlocked, carSpeed,
+  clamp, dist, createPlayer, createPed, createCar, createBoat, nearestVehicle,
+  collideMove, isWalkableTile, updatePlayer, updatePlayerVehicle, updateTraffic,
+  updatePeds, updateBullets, updateParticles, resolveVehicleCollisions,
+  maintainTraffic, maintainPeds,
 } from './entities.js';
-import { updateWanted, updatePolice } from './police.js';
+import { createWanted, updateWanted, clearHeat } from './police.js';
 import {
-  createStory, currentMission, startMission, activateMission, rewardMission,
-  failMission, updateMission, createTaxi, updateTaxi, createRace, startRace, startRace2, updateRace,
-  createCourier, startCourier, updateCourier,
+  createStory, createJobs, updateStory, updateJobs, updateDialogue, failMission,
+  startRace, startCourier,
 } from './missions.js';
-import { drawWorld } from './render.js';
+import { createAudio } from './audio.js';
+import { createInput } from './input.js';
+import { createRenderer } from './render.js';
 import { createMinimap } from './minimap.js';
-import { setupShot, createShotDriver } from './shots.js';
+import { stageShot } from './shots.js';
 
-const canvas = document.getElementById('game');
-const ctx = canvas.getContext('2d');
-const mmCtx = document.getElementById('minimap').getContext('2d');
-const $ = (id) => document.getElementById(id);
-const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
-const dist2 = (ax, ay, bx, by) => { const dx = ax - bx, dy = ay - by; return dx * dx + dy * dy; };
+// ---------------------------------------------------------------------------
+// State
 
-// ------------------------------------------------------------------ state
-function freshState() {
-  const city = generateCity(CITY_SEED);
-  const terminal = city.buildings.find((b) => b.name === 'Terminal de Buses');
+export function createGame(seed, audio) {
+  const city = generateCity(seed);
+  const rng = createRandom((seed ^ 0x5eed) >>> 0);
   const state = {
-    mode: 'title', time: 0, clock: START_CLOCK, darkness: 0, shake: 0, hurtT: 0,
-    city, cars: [], boats: [], peds: [], bullets: [], particles: [], pickups: [], skids: [],
-    floaters: [], events: [], lastThreat: null, heli: null,
-    weather: { raining: false, wet: 0, nextT: 150 + Math.random() * 150, leftT: 0 },
-    radioT: 0,
-    player: {
-      x: terminal.door.x, y: terminal.door.y + 36, angle: Math.PI / 2,
-      hp: 100, maxHp: 100, armor: 0, cash: 25, weapon: 'fist', fireCd: 0,
-      owned: { fist: true, pistol: false, smg: false, shotgun: false, rifle: false },
-      ammo: { pistol: 0, smg: 0, shotgun: 0, rifle: 0 }, inCar: null, inBoat: null,
-    },
-    wanted: { heat: 0, stars: 0, bust: 0, unseenT: 0, seen: false, lastCrimeT: -99 },
-    story: createStory(), mission: { marker: null, objective: '' },
-    taxi: createTaxi(), race: createRace(), courier: createCourier(),
-    packagesFound: new Set(),
-    camera: { x: 0, y: 0, w: canvas.width, h: canvas.height },
-    dialogue: null, banner: null, shopOpen: null, prompt: '',
-    district: null, districtT: 0, startT: 0, shotMode: null, driver: null,
-    audio: new AudioEngine(), minimap: null,
+    seed, city, rng,
+    audio: audio || createAudio(),
+    time: 0,
+    tod: CLOCK.startMinute,
+    player: createPlayer(city.spots.spawn.x, city.spots.spawn.y),
+    cash: MONEY.startCash,
+    armor: 0,
+    weaponsOwned: { pistol: false, smg: false, shotgun: false, rifle: false },
+    ammo: { pistol: 0, smg: 0, shotgun: 0, rifle: 0 },
+    weapon: 'fists',
+    cars: [], peds: [], boats: [], bullets: [], particles: [], skids: [], floaters: [],
+    vehicle: null, ownCar: null, ownBoat: null,
+    wanted: createWanted(),
+    story: createStory(),
+    jobs: createJobs(),
+    crimes: [], flags: {},
+    dialogue: null, menu: null, menuCar: null,
+    marker: null, objectiveText: '',
+    district: city.districtAtPx(city.spots.spawn.x, city.spots.spawn.y),
+    weather: { rain: 0, left: 0, nextIn: rng.range(120, 240) },
+    lastShot: null,
+    over: null,
+    packagesFound: 0,
+    ambientT: 0, fixtureT: 0,
+    fixtures: [],
   };
-  state.minimap = createMinimap(city);
-  state.playerCar = () => state.player.inCar;
-  state.damagePlayer = (amount) => damagePlayer(state, amount);
-  state.onArrested = () => arrested(state);
-  state.saveGame = () => saveGame(state);
-  // the parked-car population of the city
-  for (const s of city.parkedSpots) {
-    if (city.tileAtPx(s.x, s.y) === T.WATER) continue;
-    state.cars.push(createVehicle(city, s.type, s.x, s.y, s.angle, { kind: 'parked' }));
+  for (const pc of city.parkedCars) {
+    state.cars.push(createCar(pc.type, pc.x, pc.y, pc.angle, pc.color, 'parked'));
   }
-  // the moored fleet: dinghies and speedboats at the docks and the island
-  for (const s of city.boatSpots) state.boats.push(createBoat(city, s.type, s.x, s.y, s.angle));
+  for (const bs of city.spots.boatSpots) {
+    state.boats.push(createBoat(bs.type, bs.x, bs.y, bs.angle, '#e8e6df', 'moored'));
+  }
+  state.fixtures = [
+    { spot: 'marisol', name: 'Marisol Vega', shirt: '#b03060', ped: null },
+    { spot: 'safehouse', name: 'Darío', shirt: '#37474f', ped: null },
+  ];
+  maintainFixtures(state);
+  for (let i = 0; i < 26; i += 1) { maintainTraffic(state); maintainPeds(state); }
   return state;
 }
 
-function damagePlayer(state, amount) {
-  const p = state.player;
-  if (state.mode !== 'play') return;
-  let eff = (p.inCar || p.inBoat) ? amount * 0.3 : amount;
-  if (p.armor > 0) { // the vest eats most of what gets through, until it is spent
-    const absorbed = Math.min(p.armor, eff * 0.75);
-    p.armor -= absorbed; eff -= absorbed;
-  }
-  p.hp -= eff;
-  state.hurtT = Math.min(0.8, state.hurtT + 0.3);
-  state.shake = Math.min(10, state.shake + 2);
-  if (state.audio) state.audio.hit();
-  if (p.hp <= 0) downed(state);
+export function addFloater(state, x, y, text, color = '#ffd23e', size = 19) {
+  state.floaters.push({ x, y, text, color, size, t: 0, maxLife: 2.2 });
 }
 
-// -------------------------------------------------------------- save/load
-function saveGame(state) {
-  try {
-    const p = state.player;
-    const data = {
-      v: 1, cash: p.cash, hp: p.hp, armor: p.armor, x: p.x, y: p.y, angle: p.angle, clock: state.clock,
-      storyIndex: state.story.index, owned: p.owned, ammo: p.ammo, weapon: p.weapon,
-      packages: [...state.packagesFound],
-      car: p.inCar ? { type: p.inCar.type, x: p.inCar.x, y: p.inCar.y, angle: p.inCar.angle, hp: p.inCar.hp, color: p.inCar.color } : null,
-      boat: p.inBoat ? { type: p.inBoat.type, x: p.inBoat.x, y: p.inBoat.y, angle: p.inBoat.angle, hp: p.inBoat.hp, color: p.inBoat.color } : null,
-    };
-    localStorage.setItem(SAVE_KEY, JSON.stringify(data));
-  } catch { /* storage unavailable: the game simply does not persist */ }
-}
+// ---------------------------------------------------------------------------
+// Interactions (the E key) and shops
 
-function loadSave(state) {
-  try {
-    const raw = localStorage.getItem(SAVE_KEY);
-    if (!raw) return false;
-    const d = JSON.parse(raw);
-    const p = state.player;
-    p.cash = d.cash; p.hp = d.hp; p.armor = d.armor || 0; p.x = d.x; p.y = d.y; p.angle = d.angle;
-    // merge over the defaults so saves from before the rifle existed load clean
-    p.owned = Object.assign({ fist: true, pistol: false, smg: false, shotgun: false, rifle: false }, d.owned);
-    p.ammo = Object.assign({ pistol: 0, smg: 0, shotgun: 0, rifle: 0 }, d.ammo);
-    p.weapon = d.weapon || 'fist';
-    state.clock = d.clock ?? START_CLOCK;
-    state.story.index = d.storyIndex || 0;
-    state.packagesFound = new Set(d.packages || []);
-    if (d.car) {
-      const car = createVehicle(state.city, d.car.type, d.car.x, d.car.y, d.car.angle, { kind: 'parked', color: d.car.color });
-      car.hp = d.car.hp;
-      state.cars.push(car);
-      p.inCar = car;
-    }
-    if (d.boat) {
-      const boat = createBoat(state.city, d.boat.type, d.boat.x, d.boat.y, d.boat.angle, { color: d.boat.color });
-      boat.hp = d.boat.hp;
-      state.boats.push(boat);
-      p.inBoat = boat;
-      p.x = boat.x; p.y = boat.y;
-    }
-    return true;
-  } catch { return false; }
-}
-
-function hasSave() {
-  try { return !!localStorage.getItem(SAVE_KEY); } catch { return false; }
-}
-
-// ------------------------------------------------------------- consequences
-function clearHeat(state) {
-  state.wanted.heat = 0; state.wanted.stars = 0; state.wanted.bust = 0;
-  for (const c of state.cars) if (c.kind === 'police') c.leaving = true;
-}
-
-function downed(state) {
-  const p = state.player;
-  if (state.story.phase === 'active' || state.story.phase === 'intro') failMission(state);
-  if (state.taxi.active) state.taxi.active = false;
-  if (state.race.active) state.race.active = false;
-  if (state.courier.active) state.courier.active = false;
-  const fee = Math.min(p.cash, 25 + Math.floor(p.cash * 0.1));
-  p.cash -= fee;
-  p.inCar = null; p.inBoat = null; p.hp = p.maxHp;
-  p.x = state.city.hospital.door.x; p.y = state.city.hospital.door.y + 30;
-  clearHeat(state);
-  state.mode = 'downed';
-  $('endTitle').textContent = 'DOWNED';
-  $('endSub').textContent = 'You wake up at Hospital San Solano. The bill comes to $' + fee + ' — the bay is still out there.';
-  $('endcard').classList.remove('hidden');
-  if (state.audio) state.audio.jingle(false);
-}
-
-function arrested(state) {
-  const p = state.player;
-  if (state.story.phase === 'active' || state.story.phase === 'intro') failMission(state);
-  if (state.taxi.active) state.taxi.active = false;
-  if (state.race.active) state.race.active = false;
-  if (state.courier.active) state.courier.active = false;
-  const fine = Math.min(p.cash, 100 + state.wanted.stars * 60);
-  p.cash -= fine;
-  p.inCar = null; p.inBoat = null; p.hp = Math.max(40, p.hp);
-  p.x = state.city.policeStation.door.x; p.y = state.city.policeStation.door.y + 30;
-  clearHeat(state);
-  state.mode = 'arrested';
-  $('endTitle').textContent = 'ARRESTED';
-  $('endSub').textContent = 'La Patrulla takes $' + fine + ' and your afternoon. You walk out of Comisaría Central with a warning.';
-  $('endcard').classList.remove('hidden');
-  if (state.audio) state.audio.jingle(false);
-}
-
-// ------------------------------------------------------------ ambient life
-function spawnAmbient(state, dt) {
-  const p = state.player, city = state.city;
-  // traffic: keep the avenues alive near the player
-  const traffic = state.cars.filter((c) => c.kind === 'traffic' && c !== p.inCar);
-  if (traffic.length < MAX_TRAFFIC) {
-    for (let tries = 0; tries < 6; tries++) {
-      const a = Math.random() * 6.283, d = 560 + Math.random() * 320;
-      const x = p.x + Math.cos(a) * d, y = p.y + Math.sin(a) * d;
-      const t = city.tileAtPx(x, y);
-      if (t !== T.ROAD && t !== T.BRIDGE) continue;
-      const type = ['compact', 'sedan', 'sedan', 'muscle', 'pickup', 'taxi'][Math.floor(Math.random() * 6)];
-      const car = createVehicle(city, type, x, y, Math.round(a / (Math.PI / 2)) * (Math.PI / 2), { kind: 'traffic' });
-      state.cars.push(car);
-      break;
-    }
-  }
-  for (const c of traffic) if (dist2(c.x, c.y, p.x, p.y) > 1250 * 1250 && !c.marked) c.removeMe = true;
-  // pedestrians near the player
-  const walkers = state.peds.filter((pp) => !pp.hostile);
-  if (walkers.length < MAX_PEDS) {
-    for (let tries = 0; tries < 6; tries++) {
-      const tx = Math.floor(p.x / TILE) + Math.floor((Math.random() - 0.5) * 34);
-      const ty = Math.floor(p.y / TILE) + Math.floor((Math.random() - 0.5) * 34);
-      const t = city.tileAt(tx, ty);
-      if (![T.SIDEWALK, T.PLAZA, T.PARK, T.SAND, T.DOCK].includes(t)) continue;
-      const x = tx * TILE + 16, y = ty * TILE + 16;
-      if (dist2(x, y, p.x, p.y) < 330 * 330) continue;
-      state.peds.push(createPed(x, y));
-      break;
-    }
-  }
-  // ambient walkers fade out with distance; beat officers are fixtures
-  // of their posts and are never culled (police.js keeps the beats manned)
-  for (const pp of walkers) if (!pp.cop && dist2(pp.x, pp.y, p.x, p.y) > 1000 * 1000) pp.removeMe = true;
-  state.peds = state.peds.filter((pp) => !pp.removeMe);
-  state.cars = state.cars.filter((c) => !c.removeMe);
-}
-
-// ----------------------------------------------------------------- player
-function updatePlayer(state, dt) {
-  const p = state.player, city = state.city;
-  p.fireCd -= dt;
-  const mp = mousePos();
-  const aimWorld = { x: state.camera.x + mp.x, y: state.camera.y + mp.y };
-
-  if (p.inBoat) {
-    const boat = p.inBoat;
-    const ctrl = {
-      throttle: (down('KeyW', 'ArrowUp') ? 1 : 0) + (down('KeyS', 'ArrowDown') ? -1 : 0),
-      steer: (down('KeyA', 'ArrowLeft') ? -1 : 0) + (down('KeyD', 'ArrowRight') ? 1 : 0),
-    };
-    stepBoat(state, boat, ctrl, dt);
-    p.x = boat.x; p.y = boat.y; p.angle = boat.angle;
-    if (boat.dead) {
-      // the hull gives up under you: swim for the nearest shore, barely
-      p.inBoat = null;
-      const shore = findShoreSpot(state, boat) || city.spots.boatDock;
-      p.x = shore.x; p.y = shore.y;
-      damagePlayer(state, 16);
-      state.floaters.push({ x: p.x, y: p.y - 26, text: 'You wash ashore, coughing bay water', life: 2.2, color: '#9fc6e8' });
-      return;
-    }
-    if (mouseDown()) tryFire(state, aimWorld);
-    return;
-  }
-
-  if (p.inCar) {
-    const car = p.inCar;
-    const ctrl = {
-      throttle: (down('KeyW', 'ArrowUp') ? 1 : 0) + (down('KeyS', 'ArrowDown') ? -1 : 0),
-      steer: (down('KeyA', 'ArrowLeft') ? -1 : 0) + (down('KeyD', 'ArrowRight') ? 1 : 0),
-      handbrake: down('Space'),
-    };
-    stepVehicle(state, car, ctrl, dt);
-    p.x = car.x; p.y = car.y; p.angle = car.angle;
-    if (mouseDown()) tryFire(state, aimWorld);
-    return;
-  }
-
-  // on foot
-  let mx = (down('KeyD', 'ArrowRight') ? 1 : 0) - (down('KeyA', 'ArrowLeft') ? 1 : 0);
-  let my = (down('KeyS', 'ArrowDown') ? 1 : 0) - (down('KeyW', 'ArrowUp') ? 1 : 0);
-  const len = Math.hypot(mx, my);
-  if (len > 0) {
-    mx /= len; my /= len;
-    const speed = down('ShiftLeft', 'ShiftRight') ? 228 : 148;
-    moveCircle(city, p, 11, p.x + mx * speed * dt, p.y + my * speed * dt);
-  }
-  p.angle = Math.atan2(aimWorld.y - p.y, aimWorld.x - p.x);
-  if (mouseDown() || down('Space')) tryFire(state, aimWorld);
-}
-
-function tryFire(state, aimWorld) {
-  const p = state.player;
-  if (p.fireCd > 0 || state.dialogue || state.shopOpen) return;
-  const def = WEAPONS[p.weapon];
-  const angle = Math.atan2(aimWorld.y - p.y, aimWorld.x - p.x);
-  if (def.melee) {
-    p.fireCd = def.cooldown;
-    if (state.audio) state.audio.punch();
-    spawnParticles(state, 'muzzle', p.x + Math.cos(angle) * 16, p.y + Math.sin(angle) * 16, 1);
-    let hitSomething = false;
-    for (const ped of state.peds) {
-      if (ped.dead) continue;
-      const d = Math.hypot(ped.x - p.x, ped.y - p.y);
-      if (d < 36 && Math.abs(angleDelta(angle, Math.atan2(ped.y - p.y, ped.x - p.x))) < 1.1) {
-        hurtPed(state, ped, def.damage, angle, true);
-        hitSomething = true;
-      }
-    }
-    for (const car of state.cars) {
-      if (car === p.inCar) continue;
-      if (Math.hypot(car.x - p.x, car.y - p.y) < car.def.h + 26) {
-        damageCar(state, car, 5, 'melee');
-        spawnParticles(state, 'spark', car.x, car.y, 3);
-        hitSomething = true;
-        if (car.kind === 'police') state.events.push({ kind: 'crime', crime: 'hitCop', x: car.x, y: car.y });
-      }
-    }
-    for (const boat of state.boats) {
-      if (boat === p.inBoat) continue;
-      if (Math.hypot(boat.x - p.x, boat.y - p.y) < boat.def.h + 26) {
-        damageBoat(state, boat, 5, 'melee');
-        spawnParticles(state, 'splash', boat.x, boat.y, 3);
-        hitSomething = true;
-        if (boat.kind === 'police') state.events.push({ kind: 'crime', crime: 'hitCop', x: boat.x, y: boat.y });
-      }
-    }
-    if (hitSomething && state.audio) state.audio.hit();
-    return;
-  }
-  const key = def.ammoKey;
-  if (p.ammo[key] <= 0) {
-    p.fireCd = 0.3;
-    if (state.audio) state.audio.uiClick();
-    state.floaters.push({ x: p.x, y: p.y - 24, text: 'Sin balas — visita Armas Solano', life: 1.4, color: '#e34f4f' });
-    return;
-  }
-  p.fireCd = def.cooldown;
-  p.ammo[key]--;
-  for (let i = 0; i < def.pellets; i++) {
-    const a = angle + (Math.random() - 0.5) * 2 * def.spread;
-    spawnBullet(state, p.x + Math.cos(angle) * 14, p.y + Math.sin(angle) * 14, a, def, false);
-  }
-  if (state.audio) state.audio.shot(p.weapon);
-  state.lastThreat = { x: p.x, y: p.y, t: state.time };
-  state.events.push({ kind: 'crime', crime: 'gunfire', x: p.x, y: p.y });
-  state.shake = Math.min(8, state.shake + (p.weapon === 'shotgun' ? 2.4 : 0.7));
-}
-
-function angleDelta(a, b) {
-  let d = (b - a) % (Math.PI * 2);
-  if (d > Math.PI) d -= Math.PI * 2;
-  if (d < -Math.PI) d += Math.PI * 2;
-  return d;
-}
-
-// ------------------------------------------------------------ interactions
-function nearestCar(state, r) {
-  const p = state.player;
-  let best = null, bd = r * r;
-  for (const c of state.cars) {
-    const d = dist2(c.x, c.y, p.x, p.y);
-    if (d < bd) { bd = d; best = c; }
-  }
-  return best;
-}
-
-function enterCar(state, car) {
-  const p = state.player;
-  if (car.kind === 'traffic') {
-    // the driver bails out and runs
-    const driver = createPed(car.x + 14, car.y + 10);
-    driver.fleeFrom = { x: p.x, y: p.y }; driver.fleeT = 3.2;
-    state.peds.push(driver);
-    state.events.push({ kind: 'crime', crime: 'theft', x: car.x, y: car.y });
-    car.stolen = true;
-  } else if (car.kind === 'police') {
-    state.events.push({ kind: 'crime', crime: 'theft', x: car.x, y: car.y, certain: true });
-    car.kind = 'parked'; car.stolen = true;
-  } else if (car.marked) {
-    state.events.push({ kind: 'crime', crime: 'theft', x: car.x, y: car.y });
-  }
-  p.inCar = car;
-  if (state.audio) state.audio.door();
-}
-
-function exitCar(state) {
-  const p = state.player, car = p.inCar;
-  if (!car) return;
-  if (carSpeed(car) > 65) {
-    state.floaters.push({ x: p.x, y: p.y - 26, text: 'Too fast to jump out!', life: 1.2, color: '#e34f4f' });
-    return;
-  }
-  const side = car.angle + Math.PI / 2;
-  const nx = car.x + Math.cos(side) * (car.def.h + 16);
-  const ny = car.y + Math.sin(side) * (car.def.h + 16);
-  if (!moveCircle(state.city, p, 11, nx, ny).hitX) { p.x = nx; p.y = ny; }
-  if (car.stolen && car.kind === 'traffic') car.kind = 'parked';
-  p.inCar = null;
-  if (state.audio) state.audio.door();
-}
-
-// The nearest steppable shore point around a boat, or null: a ring of
-// probes at growing radii, the first dry, unblocked spot wins.
-function findShoreSpot(state, boat) {
-  const city = state.city;
-  for (const r of [boat.def.w * 0.5 + 15, 62, 92, 132]) {
-    for (let i = 0; i < 16; i++) {
-      const a = (i / 16) * Math.PI * 2;
-      const nx = boat.x + Math.cos(a) * r, ny = boat.y + Math.sin(a) * r;
-      if (city.tileAtPx(nx, ny) === T.WATER) continue;
-      if (!circleBlocked(city, nx, ny, 11)) return { x: nx, y: ny };
+function findShoreExit(state, boat) {
+  for (let r = 20; r <= 64; r += 10) {
+    for (let k = 0; k < 8; k += 1) {
+      const a = (k / 8) * Math.PI * 2;
+      const x = boat.x + Math.cos(a) * r;
+      const y = boat.y + Math.sin(a) * r;
+      if (isWalkableTile(state.city.tileAtPx(x, y))) return { x, y };
     }
   }
   return null;
 }
 
-function nearestBoat(state, r) {
+export function interact(state) {
   const p = state.player;
-  let best = null, bd = r * r;
-  for (const b of state.boats) {
-    if (b.dead) continue;
-    const d = dist2(b.x, b.y, p.x, p.y);
-    if (d < bd) { bd = d; best = b; }
-  }
-  return best;
-}
+  if (state.dialogue || state.over) return;
+  if (state.menu) { state.menu = null; state.audio?.sfx('exit'); return; }
 
-function enterBoat(state, boat) {
-  const p = state.player;
-  p.inBoat = boat;
-  p.x = boat.x; p.y = boat.y; p.angle = boat.angle;
-  if (state.audio) state.audio.door();
-}
-
-function exitBoat(state) {
-  const p = state.player, boat = p.inBoat;
-  if (!boat) return;
-  if (Math.abs(boat.speed) > 60) {
-    state.floaters.push({ x: p.x, y: p.y - 26, text: 'Too fast to step out!', life: 1.2, color: '#e34f4f' });
-    return;
-  }
-  const shore = findShoreSpot(state, boat);
-  if (!shore) {
-    state.floaters.push({ x: p.x, y: p.y - 26, text: 'No shore within reach', life: 1.2, color: '#e34f4f' });
-    return;
-  }
-  p.x = shore.x; p.y = shore.y;
-  p.inBoat = null;
-  if (state.audio) state.audio.door();
-}
-
-function scanInteractions(state) {
-  const p = state.player, city = state.city;
-  state.prompt = '';
-  if (state.dialogue || state.shopOpen || state.mode !== 'play') return;
-
-  if (p.inBoat) {
-    if (findShoreSpot(state, p.inBoat)) {
-      state.prompt = 'Step ashore';
-      if (pressed('KeyE')) exitBoat(state);
-    } else state.prompt = p.inBoat.def.name + ' — reach a shore to step out';
-    return;
-  }
-
-  if (p.inCar) {
-    const car = p.inCar;
-    for (const s of city.shops) {
-      if (s.type === 'customs' && dist2(s.door.x, s.door.y, p.x, p.y) < 110 * 110) {
-        state.prompt = 'Solano Customs — repaint & repair';
-        if (pressed('KeyE')) openShop(state, s);
-        return;
+  if (state.vehicle) {
+    const veh = state.vehicle;
+    // At a race start, E means "race", not "get out".
+    if (veh.kind === 'car' && !state.jobs.race.active) {
+      if (dist(p.x, p.y, state.city.spots.raceHarbour.x, state.city.spots.raceHarbour.y) < 62) {
+        if (startRace(state, 'harbour')) return;
+      }
+      if (dist(p.x, p.y, state.city.spots.raceIsla.x, state.city.spots.raceIsla.y) < 62) {
+        if (startRace(state, 'isla')) return;
       }
     }
-    if (!state.race.active && dist2(city.raceStart.x, city.raceStart.y, p.x, p.y) < 84 * 84) {
-      state.prompt = 'Start the Harbour Run — $' + PRICES.racePrize + ' prize';
-      if (pressed('KeyE')) startRace(state);
-      return;
+    if (veh.kind === 'boat') {
+      const shore = findShoreExit(state, veh);
+      if (!shore) {
+        addFloater(state, p.x, p.y - 30, 'Too far from shore to step out', '#ff9a8a', 16);
+        state.audio?.sfx('error');
+        return;
+      }
+      p.x = shore.x;
+      p.y = shore.y;
+    } else {
+      // Step out beside the car, on whichever side is free.
+      const temp = { x: veh.x, y: veh.y };
+      const side = Math.PI / 2;
+      let placed = false;
+      for (const s of [1, -1]) {
+        temp.x = veh.x;
+        temp.y = veh.y;
+        const dx = Math.cos(veh.angle + side * s) * (veh.radius + 20);
+        const dy = Math.sin(veh.angle + side * s) * (veh.radius + 20);
+        if (!collideMove(state.city, temp, dx, dy, p.radius, 'land')) {
+          p.x = temp.x;
+          p.y = temp.y;
+          placed = true;
+          break;
+        }
+      }
+      if (!placed) { p.x = veh.x + veh.radius + 22; p.y = veh.y; }
     }
-    if (!state.race.active && dist2(city.race2Start.x, city.race2Start.y, p.x, p.y) < 84 * 84) {
-      state.prompt = 'Start the Isla Loop — $' + PRICES.race2Prize + ' prize';
-      if (pressed('KeyE')) startRace2(state);
-      return;
-    }
-    state.prompt = 'Exit ' + car.def.name;
-    if (pressed('KeyE')) exitCar(state);
+    veh.driver = null;
+    state.vehicle = null;
+    state.audio?.sfx('exit');
     return;
   }
 
-  const boat = nearestBoat(state, 62);
-  if (boat) {
-    state.prompt = 'Board the ' + boat.def.name;
-    if (pressed('KeyE')) enterBoat(state, boat);
+  // On foot, near something with a door?
+  const spots = state.city.spots;
+  if (dist(p.x, p.y, spots.gunshop.x, spots.gunshop.y) < 58) {
+    state.menu = 'gun';
+    state.audio?.sfx('enter');
     return;
   }
-  const car = nearestCar(state, 54);
-  if (car) {
-    state.prompt = 'Enter ' + car.def.name;
-    if (pressed('KeyE')) enterCar(state, car);
-    return;
-  }
-  for (const s of city.shops) {
-    if (s.type === 'customs') continue;
-    if (dist2(s.door.x, s.door.y, p.x, p.y) < 58 * 58) {
-      state.prompt = s.name;
-      if (pressed('KeyE')) openShop(state, s);
+  if (dist(p.x, p.y, spots.customs.x, spots.customs.y) < 64) {
+    let best = null;
+    let bestD = 130;
+    for (const car of state.cars) {
+      if (car.dead) continue;
+      const d = dist(p.x, p.y, car.x, car.y);
+      if (d < bestD) { bestD = d; best = car; }
+    }
+    if (best) {
+      state.menu = 'customs';
+      state.menuCar = best;
+      state.audio?.sfx('enter');
       return;
     }
   }
-  if (!state.courier.active) {
-    for (const s of city.courierSpots) {
-      if (dist2(s.x, s.y, p.x, p.y) < 52 * 52) {
-        state.prompt = 'Courier — pick up a package';
-        if (pressed('KeyE')) startCourier(state, s);
+  if (dist(p.x, p.y, spots.safehouse.x, spots.safehouse.y) < 58) {
+    p.hp = 100;
+    persistSave(state);
+    addFloater(state, p.x, p.y - 34, 'Saved at Casa de Darío — wounds tended', '#7dff8a', 17);
+    state.audio?.sfx('win');
+    return;
+  }
+  for (const spot of spots.courierSpots) {
+    if (dist(p.x, p.y, spot.x, spot.y) < 54) {
+      if (startCourier(state)) {
+        addFloater(state, p.x, p.y - 34, 'Package picked up — move!', '#2ed3ff', 17);
         return;
       }
     }
   }
-  if (dist2(city.safehouse.door.x, city.safehouse.door.y, p.x, p.y) < 58 * 58) {
-    state.prompt = 'Casa de Dario — save & rest';
-    if (pressed('KeyE')) {
-      p.hp = p.maxHp;
-      state.saveGame();
-      state.floaters.push({ x: p.x, y: p.y - 26, text: 'Guardado — game saved', life: 1.8, color: '#57e389' });
-      if (state.audio) state.audio.heal();
+  // Into the nearest vehicle.
+  const veh = nearestVehicle(state, p.x, p.y, 64);
+  if (veh) {
+    veh.driver = p;
+    state.vehicle = veh;
+    p.x = veh.x;
+    p.y = veh.y;
+    if (veh.kind === 'car') {
+      if (state.ownCar !== veh) state.crimes.push({ kind: 'theft', x: veh.x, y: veh.y });
+      state.ownCar = veh;
+      state.audio?.sfx('enter');
+    } else {
+      if (state.ownBoat !== veh) state.crimes.push({ kind: 'theft', x: veh.x, y: veh.y });
+      state.ownBoat = veh;
+      state.audio?.sfx('splash', { vol: 0.5 });
     }
   }
 }
 
-// ------------------------------------------------------------------- shop
-function openShop(state, shop) {
-  state.shopOpen = shop;
+// --- Shop operations (also called by the harness) ---------------------------
+
+export function buyWeapon(state, key) {
+  const spec = WEAPONS[key];
+  if (!spec || state.weaponsOwned[key]) return false;
+  if (state.cash < spec.price) { state.audio?.sfx('error'); return false; }
+  state.cash -= spec.price;
+  state.weaponsOwned[key] = true;
+  state.ammo[key] = (state.ammo[key] || 0) + AMMO_PACK;
+  state.weapon = key;
+  state.audio?.sfx('buy');
+  return true;
+}
+
+export function buyAmmo(state, key) {
+  const spec = WEAPONS[key];
+  if (!spec || !state.weaponsOwned[key]) return false;
+  if (state.cash < spec.ammoPrice) { state.audio?.sfx('error'); return false; }
+  state.cash -= spec.ammoPrice;
+  state.ammo[key] += AMMO_PACK;
+  state.audio?.sfx('buy');
+  return true;
+}
+
+export function buyArmor(state) {
+  if (state.armor >= 100) return false;
+  const cost = Math.max(40, Math.ceil(((100 - state.armor) / 100) * ARMOR_PRICE));
+  if (state.cash < cost) { state.audio?.sfx('error'); return false; }
+  state.cash -= cost;
+  state.armor = 100;
+  state.audio?.sfx('buy');
+  return true;
+}
+
+export function repaintCar(state, car, color) {
+  if (!car || state.cash < MONEY.repaintPrice) { state.audio?.sfx('error'); return false; }
+  state.cash -= MONEY.repaintPrice;
+  car.color = color;
+  state.audio?.sfx('buy');
+  return true;
+}
+
+export function repairCar(state, car) {
+  if (!car) return false;
+  const missing = car.maxHp - car.hp;
+  if (missing <= 0) return false;
+  const cost = Math.ceil(missing * MONEY.repairPerHp);
+  if (state.cash < cost) { state.audio?.sfx('error'); return false; }
+  state.cash -= cost;
+  car.hp = car.maxHp;
+  car.dead = false;
+  state.audio?.sfx('buy');
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Save / load
+
+export function serializeSave(state) {
+  const veh = state.vehicle;
+  return {
+    v: 1,
+    cash: state.cash,
+    armor: state.armor,
+    weaponsOwned: state.weaponsOwned,
+    ammo: state.ammo,
+    weapon: state.weapon,
+    storyIndex: state.story.index,
+    storyComplete: state.story.complete,
+    packages: state.city.packages.filter((pk) => pk.taken).map((pk) => pk.id),
+    tod: state.tod,
+    player: { x: state.player.x, y: state.player.y },
+    vehicle: veh ? { kind: veh.kind, type: veh.type, color: veh.color, x: veh.x, y: veh.y, angle: veh.angle, hp: veh.hp } : null,
+  };
+}
+
+export function applySave(state, data) {
+  if (!data) return;
+  state.cash = data.cash ?? state.cash;
+  state.armor = data.armor ?? 0;
+  Object.assign(state.weaponsOwned, data.weaponsOwned || {});
+  Object.assign(state.ammo, data.ammo || {});
+  state.weapon = data.weapon || 'fists';
+  state.story.index = data.storyIndex || 0;
+  state.story.complete = !!data.storyComplete;
+  state.tod = data.tod ?? state.tod;
+  for (const id of data.packages || []) {
+    const pkg = state.city.packages[id];
+    if (pkg && !pkg.taken) { pkg.taken = true; state.packagesFound += 1; }
+  }
+  if (data.player) { state.player.x = data.player.x; state.player.y = data.player.y; }
+  if (data.vehicle) {
+    const v = data.vehicle;
+    const veh = v.kind === 'boat'
+      ? createBoat(v.type, v.x, v.y, v.angle, v.color, 'moored')
+      : createCar(v.type, v.x, v.y, v.angle, v.color, 'parked');
+    veh.hp = v.hp;
+    if (v.kind === 'boat') { state.boats.push(veh); state.ownBoat = veh; }
+    else { state.cars.push(veh); state.ownCar = veh; }
+    veh.driver = state.player;
+    state.vehicle = veh;
+    state.player.x = veh.x;
+    state.player.y = veh.y;
+  }
+}
+
+export function persistSave(state) {
+  if (state.flags.noSave) return;
+  try {
+    window.localStorage.setItem(SAVE_KEY, JSON.stringify(serializeSave(state)));
+  } catch { /* storage off: the visit is the save */ }
+}
+
+export function loadSaveData() {
+  try {
+    const raw = window.localStorage.getItem(SAVE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function clearSave() {
+  try { window.localStorage.removeItem(SAVE_KEY); } catch { /* ignore */ }
+}
+
+// ---------------------------------------------------------------------------
+// Fixtures: the two story contacts are permanent residents of their spots.
+
+function maintainFixtures(state) {
+  for (const f of state.fixtures) {
+    if (f.ped && !f.ped.dead && state.peds.includes(f.ped)) continue;
+    const spot = state.city.spots[f.spot];
+    f.ped = createPed(state.rng, spot.x + 14, spot.y + 8, 'contact', { name: f.name, shirt: f.shirt });
+    state.peds.push(f.ped);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The step
+
+function beginOver(state, kind) {
+  if (state.story.phase === 'active' || state.story.phase === 'intro') failMission(state);
+  state.over = { kind, t: 2.4, bill: 0 };
+  state.audio?.sfx(kind === 'busted' ? 'busted' : 'downed');
+}
+
+function finishOver(state) {
   const p = state.player;
-  const items = [];
-  if (shop.type === 'gun') {
-    for (const w of ['pistol', 'smg', 'shotgun', 'rifle']) {
-      const def = WEAPONS[w];
-      if (!p.owned[w]) items.push({ label: def.name, price: PRICES[w], act: () => { p.owned[w] = true; p.weapon = w; p.ammo[def.ammoKey] += 12; } });
-      items.push({
-        label: 'Balas — ' + def.name + ' x' + PRICES.ammoPack[def.ammoKey], price: PRICES['ammo' + cap(def.ammoKey)],
-        act: () => { p.ammo[def.ammoKey] += PRICES.ammoPack[def.ammoKey]; },
-      });
-    }
-    if (p.armor < PRICES.armorMax) items.push({ label: 'Chaleco antibalas — body armour', price: PRICES.armor, act: () => { p.armor = PRICES.armorMax; } });
-    else items.push({ label: 'Chaleco antibalas — already wearing one', price: 0, disabled: true, act: () => {} });
-  } else if (shop.type === 'food') {
-    items.push({ label: 'Comida — restores ' + PRICES.healAmount + ' health', price: PRICES.food, act: () => { p.hp = Math.min(p.maxHp, p.hp + PRICES.healAmount); if (state.audio) state.audio.heal(); } });
-  } else if (shop.type === 'customs') {
-    const car = p.inCar;
-    if (car) {
-      items.push({
-        label: 'Repaint — new colour, Patrulla loses you', price: PRICES.repaint,
-        act: () => { car.color = '#' + Math.floor(Math.random() * 0xffffff).toString(16).padStart(6, '0'); clearHeat(state); },
-      });
-      const missing = Math.ceil(car.maxHp - car.hp);
-      if (missing > 0) items.push({ label: 'Repair — ' + missing + ' points', price: missing * PRICES.repairPerPoint, act: () => { car.hp = car.maxHp; } });
-      else items.push({ label: 'Repair — bodywork is perfect', price: 0, disabled: true, act: () => {} });
-    }
+  const over = state.over;
+  state.over = null;
+  clearHeat(state);
+  state.vehicle = null;
+  if (over.kind === 'busted') {
+    over.bill = Math.min(state.cash, MONEY.bustFine);
+    state.cash -= over.bill;
+    p.x = state.city.spots.police.x + 10;
+    p.y = state.city.spots.police.y + 26;
+    state.flags.arrested = over.bill;
+  } else {
+    over.bill = Math.min(state.cash, MONEY.hospitalBill);
+    state.cash -= over.bill;
+    p.hp = 100;
+    p.dead = false;
+    p.x = state.city.spots.hospital.x + 10;
+    p.y = state.city.spots.hospital.y + 26;
+    state.flags.hospitalBill = over.bill;
   }
-  renderShop(state, shop, items);
-  state.shopItems = items;
-  if (state.audio) state.audio.uiClick();
-}
-const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
-
-function renderShop(state, shop, items) {
-  $('shopTitle').textContent = shop.name;
-  $('shopCash').textContent = 'Your cash: $' + state.player.cash;
-  const box = $('shopItems');
-  box.innerHTML = '';
-  for (const it of items) {
-    const b = document.createElement('button');
-    b.className = 'shopItem';
-    b.disabled = !!it.disabled || state.player.cash < it.price;
-    b.innerHTML = '<span>' + it.label + '</span><span class="price">$' + it.price + '</span>';
-    b.addEventListener('click', () => {
-      if (state.player.cash < it.price) return;
-      state.player.cash -= it.price;
-      it.act();
-      if (state.audio) state.audio.cash();
-      openShop(state, shop); // re-render with the new balance
-    });
-    box.appendChild(b);
-  }
-  $('shop').classList.remove('hidden');
+  state.armor = 0;
 }
 
-function closeShop(state) {
-  state.shopOpen = null;
-  $('shop').classList.add('hidden');
-}
-
-// -------------------------------------------------------------------- HUD
-let lastStars = -1;
-function updateHUD(state) {
-  const p = state.player;
-  $('cash').textContent = '$' + p.cash;
-  const hh = Math.floor(state.clock), mm = Math.floor((state.clock - hh) * 60);
-  $('clock').textContent = String(hh).padStart(2, '0') + ':' + String(mm).padStart(2, '0') + (p.inCar ? ' · ' + p.inCar.def.name : (p.inBoat ? ' · ' + p.inBoat.def.name : ''));
-  $('packages').textContent = '📦 ' + state.packagesFound.size + ' / ' + state.city.packages.length + ' paquetes';
-  if (state.wanted.stars !== lastStars) {
-    lastStars = state.wanted.stars;
-    $('stars').innerHTML = [1, 2, 3, 4, 5].map((i) => '<span class="' + (i <= lastStars ? 'on' : '') + '">★</span>').join('');
-  }
-  $('districtTag').textContent = state.district ? state.district.name : '';
-  $('healthbar').style.width = clamp((p.hp / p.maxHp) * 100, 0, 100) + '%';
-  $('armorbar').style.width = clamp((p.armor / PRICES.armorMax) * 100, 0, 100) + '%';
-  $('radio').textContent = (state.radioT > 0 || p.inCar || p.inBoat) ? '📻 ' + state.audio.stationName() : '';
-  const def = WEAPONS[p.weapon];
-  $('weapon').innerHTML = def.name + (def.ammoKey ? ' · <span>' + p.ammo[def.ammoKey] + ' balas</span>' : '');
-  $('hurt').style.opacity = state.hurtT.toFixed(2);
-
-  // objective line: race, taxi and courier outrank the story
-  let obj = '';
-  if (state.race.active) obj = '🏁 ' + state.race.name + ' — checkpoint ' + (state.race.next + 1) + '/' + state.race.checkpoints.length + ' · ' + Math.ceil(state.race.timeLeft) + 's';
-  else if (state.taxi.active) obj = state.taxi.phase === 'pickup' ? '🚕 Pick up the fare' : '🚕 Drive to ' + (state.taxi.dest ? state.taxi.dest.name : '');
-  else if (state.courier.active) obj = '📦 Deliver to ' + state.courier.destName + ' · ⏱ ' + Math.max(0, Math.ceil(state.courier.timeLeft)) + 's';
-  else if (state.story.phase === 'active') {
-    obj = '◆ ' + state.mission.objective;
-    const m = currentMission(state.story);
-    if (m && (m.objective.type === 'checkpoints' || (m.objective.type === 'timed' && state.story.step === 1))) {
-      obj += ' · ⏱ ' + Math.max(0, Math.ceil(state.story.timer)) + 's';
-    }
-  } else if (state.mission.objective) obj = state.mission.objective;
-  $('objective').textContent = obj;
-  $('prompt').innerHTML = state.prompt ? '<b>E</b>' + state.prompt : '';
-
-  if (state.banner) {
-    $('bannerTitle').textContent = state.banner.title;
-    $('bannerSub').textContent = state.banner.sub || '';
-    $('banner').classList.add('show');
-  } else $('banner').classList.remove('show');
-
-  if (state.districtT > 0 && state.district) {
-    $('districtName').textContent = state.district.name;
-    $('districtSub').textContent = state.district.sub;
-    $('district').classList.add('show');
-  } else $('district').classList.remove('show');
-
-  state.minimap.draw(mmCtx, state, 0, 0, 184);
-}
-
-// --------------------------------------------------------------- dialogue
-function showDialogue(state) {
-  const d = state.dialogue;
-  if (!d) { $('dialogue').classList.add('hidden'); return; }
-  const line = d.lines[d.idx];
-  $('dlgWho').textContent = line.who;
-  $('dlgText').textContent = line.text;
-  $('dialogue').classList.remove('hidden');
-}
-
-function advanceDialogue(state) {
-  const d = state.dialogue;
-  if (!d) return;
-  d.idx++;
-  if (state.audio) state.audio.uiClick();
-  if (d.idx >= d.lines.length) {
-    state.dialogue = null;
-    $('dialogue').classList.add('hidden');
-    if (d.onDone === 'mission-start') activateMission(state);
-    else if (d.onDone === 'mission-reward') rewardMission(state);
-  } else showDialogue(state);
-}
-
-// ------------------------------------------------------------------- loop
-let state = freshState();
-let lastTs = 0;
-
-function frame(ts) {
-  requestAnimationFrame(frame);
-  const dt = Math.min(0.05, (ts - lastTs) / 1000 || 0.016);
-  lastTs = ts;
-  step(dt);
-  drawWorld(ctx, state);
-  if (state.mode !== 'title') updateHUD(state);
-}
-
-function step(dt) {
-  const p = state.player;
-  if (state.driver) { state.driver.update(state.time); }
-  if (pressed('KeyM')) {
-    const muted = state.audio.toggleMute();
-    state.floaters.push({ x: p.x, y: p.y - 26, text: muted ? 'Silencio' : 'Sonido', life: 1, color: '#fff' });
-  }
-
-  if (state.mode === 'title') {
-    state.time += dt;
-    if (!state.shotMode) {
-      // a slow drift over the bay while the title is up
-      state.camera.x = state.city.spots.island.x - state.camera.w / 2 + Math.sin(state.time * 0.05) * 160;
-      state.camera.y = 222 * TILE - state.camera.h / 2 + Math.cos(state.time * 0.04) * 40;
-    }
-    state.darkness = darknessFor(state.clock);
-    postUpdate();
-    return;
-  }
-  if (state.mode === 'downed' || state.mode === 'arrested') { postUpdate(); return; }
-  if (pressed('Escape', 'KeyP') && state.mode === 'play' && !state.shopOpen && !state.dialogue) {
-    state.mode = 'pause';
-    $('pause').classList.remove('hidden');
-    postUpdate();
-    return;
-  }
-  if (state.mode === 'pause') { postUpdate(); return; }
-
-  // ---- play mode
-  state.time += dt;
-  state.clock = (state.clock + (dt * 24) / DAY_LENGTH) % 24;
-  updateWeather(state, dt);
-  state.darkness = Math.min(0.66, darknessFor(state.clock) + state.weather.wet * 0.1);
-  state.hurtT = Math.max(0, state.hurtT - dt * 1.6);
-  if (state.banner) { state.banner.t -= dt; if (state.banner.t <= 0) state.banner = null; }
-  if (state.districtT > 0) state.districtT -= dt;
-
-  // dialogue and shops freeze the world
-  if (state.dialogue) {
-    showDialogue(state);
-    if (pressed('KeyE', 'Space') || state.uiClick) { state.uiClick = false; advanceDialogue(state); }
-    postUpdate();
-    return;
-  }
-  if (state.shopOpen) {
-    if (pressed('KeyE', 'Escape')) closeShop(state);
-    postUpdate();
-    return;
-  }
-
-  state.startT += dt;
-  state.uiClick = false; // clicks only advance dialogue; never leak into play
-  // the intro call comes seconds after a new game begins
-  if (state.story.index === 0 && state.story.phase === 'idle' && state.startT > 0.9 && !state.story.kickedOff) {
-    state.story.kickedOff = true;
-    startMission(state);
-    showDialogue(state);
-  }
-
-  updatePlayer(state, dt);
-  // traffic thinks for itself; parked and mission cars just settle
-  for (const car of state.cars) {
-    if (car === p.inCar || car.kind === 'police') continue;
-    if (car.kind === 'traffic') stepVehicle(state, car, trafficControl(state, car, dt), dt);
-    else stepVehicle(state, car, { throttle: 0, steer: 0, handbrake: true }, dt);
-  }
-  collideCars(state, dt);
-  spawnAmbient(state, dt);
-  updatePeds(state, dt);
-  updateBoats(state, dt);
-  updateBullets(state, dt);
-  updateParticles(state, dt);
-  updatePickups(state, dt);
-  updateWanted(state, dt);
-  updatePolice(state, dt);
-  updateMission(state, dt);
-  updateTaxi(state, dt);
-  updateRace(state, dt);
-  updateCourier(state, dt);
-  collectPackages(state);
-  scanInteractions(state);
-
-  // weapon keys
-  for (let i = 0; i < WEAPON_ORDER.length; i++) {
-    if (pressed('Digit' + (i + 1)) && p.owned[WEAPON_ORDER[i]]) {
-      p.weapon = WEAPON_ORDER[i];
-      if (state.audio) state.audio.uiClick();
-    }
-  }
-
-  // radio: R or ] tunes up a station, [ tunes down; the name flashes
-  if (pressed('KeyR', 'BracketRight')) { state.audio.nextStation(); state.radioT = 2.6; }
-  if (pressed('BracketLeft')) { state.audio.prevStation(); state.radioT = 2.6; }
-  if (state.radioT > 0) state.radioT -= dt;
-
-  // floaters rise and fade
-  for (const f of state.floaters) { f.y -= 26 * dt; f.life -= dt; }
-  state.floaters = state.floaters.filter((f) => f.life > 0);
-
-  // camera follows, a touch of lead at speed
-  const pv = p.inCar || p.inBoat;
-  const lead = pv ? 0.22 : 0;
-  const tx = clamp(p.x + (pv ? pv.vx * lead : 0) - state.camera.w / 2, 0, WORLD_PX - state.camera.w);
-  const ty = clamp(p.y + (pv ? pv.vy * lead : 0) - state.camera.h / 2, 0, WORLD_PX - state.camera.h);
-  state.camera.x += (tx - state.camera.x) * Math.min(1, dt * 7);
-  state.camera.y += (ty - state.camera.y) * Math.min(1, dt * 7);
-
-  // district flash on crossing a border
-  const d = state.city.districtAt(p.x, p.y);
-  if (!state.district || state.district.id !== d.id) {
-    if (state.district && state.startT > 2) state.districtT = 2.6;
-    state.district = d;
-  }
-
-  // audio: engine, siren, rain, music state
-  const inCar = p.inCar;
-  let nearestCop = Infinity;
-  for (const c of state.cars) if (c.kind === 'police' && !c.dead) nearestCop = Math.min(nearestCop, Math.hypot(c.x - p.x, c.y - p.y));
-  state.audio.update(dt, {
-    engine: inCar ? clamp(carSpeed(inCar) / inCar.def.topSpeed, 0, 1)
-      : (p.inBoat ? clamp(Math.abs(p.inBoat.speed) / p.inBoat.def.topSpeed, 0, 1) : null),
-    siren: nearestCop < 720,
-    sirenDist: nearestCop === Infinity ? 0 : clamp(1 - nearestCop / 720, 0, 1),
-    rain: state.weather.wet,
-  });
-
-  postUpdate();
-}
-
-function collectPackages(state) {
-  const p = state.player;
-  for (const pk of state.city.packages) {
-    if (state.packagesFound.has(pk.id)) continue;
-    if (dist2(pk.x, pk.y, p.x, p.y) < 32 * 32) {
-      state.packagesFound.add(pk.id);
-      p.cash += PRICES.packageReward;
-      spawnParticles(state, 'cash', pk.x, pk.y, 10);
-      if (state.audio) state.audio.pickup();
-      state.floaters.push({ x: pk.x, y: pk.y - 20, text: '¡Paquete! +$' + PRICES.packageReward + ' (' + state.packagesFound.size + '/20)', life: 1.8, color: '#ffd23e' });
-      if (state.packagesFound.size === 20) {
-        p.cash += 500;
-        state.banner = { title: '¡Todos los paquetes!', sub: 'All 20 hidden packages — bonus $500', t: 4 };
-      }
-    }
-  }
-}
-
-function darknessFor(clock) {
-  const sun = Math.sin(((clock - 6) / 12) * Math.PI);
-  return clamp(0.58 - sun * 0.75, 0, 0.58);
-}
-
-// --------------------------------------------------------------- weather
-// The bay has moods: every few minutes a rain band rolls in off the
-// water for a minute or so. Purely atmospheric — streaks and sheen in
-// render.js, a noise wash in audio.js, a darker sky here — but the
-// streets feel different wet.
 function updateWeather(state, dt) {
   const w = state.weather;
-  if (w.raining) {
-    w.leftT -= dt;
-    w.wet = Math.min(1, w.wet + dt / 6);
-    if (w.leftT <= 0) { w.raining = false; w.nextT = 150 + Math.random() * 180; }
+  if (w.left > 0) {
+    w.left -= dt;
+    w.rain = Math.min(1, w.rain + dt * 0.12);
   } else {
-    w.wet = Math.max(0, w.wet - dt / 10);
-    w.nextT -= dt;
-    if (w.nextT <= 0) {
-      w.raining = true;
-      w.leftT = 45 + Math.random() * 45;
-      state.floaters.push({ x: state.player.x, y: state.player.y - 30, text: '🌧 Lluvia sobre la bahía…', life: 2.4, color: '#9fc6e8' });
+    w.rain = Math.max(0, w.rain - dt * 0.1);
+    w.nextIn -= dt;
+    if (w.nextIn <= 0) {
+      w.left = state.rng.range(45, 90);
+      w.nextIn = state.rng.range(150, 330);
+      addFloater(state, state.player.x, state.player.y - 44, '🌧 Lluvia sobre la bahía…', '#bcd8ea', 16);
     }
   }
 }
 
-// -------------------------------------------------------------------- boot
-function startGame(withSave) {
-  state = freshState();
-  if (withSave) loadSave(state);
-  state.mode = 'play';
-  state.startT = 0;
-  $('title').classList.add('hidden');
-  $('hud').classList.remove('hidden');
-  $('pause').classList.add('hidden');
-  $('endcard').classList.add('hidden');
-  state.audio.unlock();
-}
-
-function boot() {
-  initInput(canvas);
-  $('btnContinue').disabled = !hasSave();
-  $('btnNew').addEventListener('click', () => startGame(false));
-  $('btnContinue').addEventListener('click', () => startGame(true));
-  $('btnResume').addEventListener('click', () => { state.mode = 'play'; $('pause').classList.add('hidden'); });
-  $('btnRestart').addEventListener('click', () => startGame(false));
-  $('btnEndOk').addEventListener('click', () => { state.mode = 'play'; $('endcard').classList.add('hidden'); });
-  canvas.addEventListener('mousedown', () => { state.audio.unlock(); state.uiClick = true; });
-  window.addEventListener('keydown', () => state.audio.unlock(), { once: true });
-  // pause overlay can also be left with Esc
-  window.addEventListener('keydown', (e) => {
-    if ((e.code === 'Escape' || e.code === 'KeyP') && state.mode === 'pause') {
-      state.mode = 'play';
-      $('pause').classList.add('hidden');
-    }
+function updateAudioEnv(state, dt) {
+  const audio = state.audio;
+  if (!audio || !audio.update) return;
+  let siren = 0;
+  for (const car of state.cars) {
+    if (car.role !== 'cop' || car.dead) continue;
+    const d = dist(state.player.x, state.player.y, car.x, car.y);
+    siren = Math.max(siren, clamp(1 - d / 720, 0, 1));
+  }
+  if (state.wanted.heli) siren = Math.max(siren, 0.35);
+  if (state.wanted.policeBoat && !state.wanted.policeBoat.dead) siren = Math.max(siren, 0.3);
+  const veh = state.vehicle;
+  let load = 0;
+  if (veh) {
+    const spec = veh.kind === 'boat' ? BOAT_TYPES[veh.type] : CAR_TYPES[veh.type];
+    load = clamp(Math.abs(veh.speed) / spec.top, 0, 1);
+  }
+  audio.update(dt, {
+    inVehicle: !!veh,
+    engineLoad: load,
+    engineRpm: load,
+    siren,
+    raining: state.weather.rain > 0.35,
+    radioAudible: !!veh,
   });
-
-  // screenshot scenes: ?shot=drive etc. pose the real game
-  const params = new URLSearchParams(location.search);
-  const shot = params.get('shot');
-  if (shot) {
-    state.mode = shot === 'start' ? 'title' : 'play';
-    if (shot !== 'start') { $('title').classList.add('hidden'); $('hud').classList.remove('hidden'); }
-    setupShot(state, shot);
-    state.driver = createShotDriver(state, shot);
-    input.scripted = state.driver.input;
-    state.startT = 99; // no intro call during a shoot
-    if (shot !== 'start') state.story.kickedOff = true;
-  }
-  requestAnimationFrame(frame);
 }
 
-boot();
+export function stepGame(state, input, dt) {
+  state.time += dt;
+  state.tod = (state.tod + CLOCK.minutesPerSecond * dt) % CLOCK.dayMinutes;
+
+  // Floaters always drift, whatever else is frozen.
+  for (let i = state.floaters.length - 1; i >= 0; i -= 1) {
+    state.floaters[i].t += dt;
+    if (state.floaters[i].t > state.floaters[i].maxLife) state.floaters.splice(i, 1);
+  }
+
+  if (state.over) {
+    state.over.t -= dt;
+    updateParticles(state, dt);
+    if (state.over.t <= 0) finishOver(state);
+    return;
+  }
+  if (state.dialogue) {
+    updateDialogue(state, input, dt);
+    updateParticles(state, dt);
+    return;
+  }
+  if (state.menu) {
+    if (input.interact || input.pause) state.menu = null;
+    return;
+  }
+
+  if (input.interact) interact(state);
+  if (state.menu) return; // an interaction just opened a shop
+  if (input.mute) state.audio?.toggleMute();
+  if (input.radioNext || input.radioPrev) {
+    const audio = state.audio;
+    if (audio && state.vehicle) {
+      const next = (audio.stationIndex() + (input.radioNext ? 1 : 2)) % 3;
+      const name = audio.setStation(next);
+      addFloater(state, state.player.x, state.player.y - 40, `📻 ${name}`, '#ffe9b0', 17);
+      audio.sfx('radio');
+    }
+  }
+  if (input.fire && state.weapon !== 'fists') {
+    state.lastShot = { x: state.player.x, y: state.player.y, t: state.time };
+  }
+
+  if (state.vehicle) updatePlayerVehicle(state, input, dt);
+  else updatePlayer(state, input, dt);
+
+  updateTraffic(state, dt);
+  updatePeds(state, dt);
+  updateWanted(state, dt);
+  resolveVehicleCollisions(state);
+  updateBullets(state, dt);
+  updateParticles(state, dt);
+  updateStory(state, input, dt);
+  updateJobs(state, dt);
+  updateWeather(state, dt);
+
+  state.ambientT -= dt;
+  if (state.ambientT <= 0) {
+    state.ambientT = 0.45;
+    maintainTraffic(state);
+    maintainPeds(state);
+  }
+  state.fixtureT -= dt;
+  if (state.fixtureT <= 0) {
+    state.fixtureT = 1.5;
+    maintainFixtures(state);
+  }
+
+  // Hidden packages.
+  if (!state.vehicle) {
+    for (const pkg of state.city.packages) {
+      if (pkg.taken) continue;
+      if (dist(state.player.x, state.player.y, pkg.x, pkg.y) < 30) {
+        pkg.taken = true;
+        state.packagesFound += 1;
+        state.cash += 25;
+        addFloater(state, pkg.x, pkg.y - 20, `+$25 — package ${state.packagesFound}/20`, '#ffd23e', 17);
+        state.audio?.sfx('pickup');
+      }
+    }
+  }
+
+  // Job and story notices become floaters.
+  const f = state.flags;
+  if (f.taxiFare) addFloater(state, state.player.x, state.player.y - 36, `Taxi fare +$${f.taxiFare}`, '#7dff8a');
+  if (f.courierPaid) addFloater(state, state.player.x, state.player.y - 36, `Courier +$${f.courierPaid}`, '#7dff8a');
+  if (f.raceWon) addFloater(state, state.player.x, state.player.y - 36, `${f.raceWon.name} — +$${f.raceWon.prize}`, '#7dff8a');
+  if (f.missionDone) persistSave(state);
+
+  // District crossings.
+  const dNow = state.city.districtAtPx(state.player.x, state.player.y);
+  if (dNow !== state.district) {
+    state.district = dNow;
+    addFloater(state, state.player.x, state.player.y - 52, DISTRICTS[dNow], '#ffffff', 22);
+  }
+
+  // Death and arrest land last, so a mission fails exactly once.
+  if (state.player.dead) beginOver(state, 'downed');
+  else if (state.flags.busted) beginOver(state, 'busted');
+
+  updateAudioEnv(state, dt);
+}
+
+// ---------------------------------------------------------------------------
+// Browser boot and HUD wiring. Everything above this line is DOM-free.
+
+if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+  const params = new URLSearchParams(window.location.search);
+  const shotName = params.get('shot');
+  const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
+  const gameSeed = Number.isInteger(seedParam) ? seedParam : 20261124;
+
+  const $ = (id) => document.getElementById(id);
+  const canvas = $('game');
+  const els = {
+    cash: $('cash'), clock: $('clock'), district: $('district'), stars: $('stars'),
+    hpFill: $('hp-fill'), armorFill: $('armor-fill'), weapon: $('weapon'),
+    packages: $('packages'), objective: $('objective'), radio: $('radio'),
+    bustWrap: $('bust-wrap'), bustFill: $('bust-fill'),
+    dialogue: $('dialogue'), dlgWho: $('dlg-who'), dlgText: $('dlg-text'),
+    banner: $('banner'), bannerTitle: $('banner-title'), bannerSub: $('banner-sub'),
+    title: $('title'), pause: $('pause'), over: $('over'),
+    overTitle: $('over-title'), overSub: $('over-sub'),
+    shop: $('shop'), shopTitle: $('shop-title'), shopItems: $('shop-items'), shopCash: $('shop-cash'),
+    status: $('status'),
+    btnNew: $('btn-new'), btnContinue: $('btn-continue'),
+  };
+
+  let game = createGame(gameSeed);
+  const renderer = createRenderer(canvas);
+  const minimap = createMinimap($('minimap'), game.city);
+  const input = createInput(canvas);
+  input.setTransform((cx, cy) => renderer.screenToWorld(cx, cy));
+
+  let mode = shotName ? 'shot' : 'title';
+  let bannerTimer = 0;
+  let builtMenu = null;
+  let wasOver = false;
+
+  function announce(message) { els.status.textContent = message; }
+
+  function showBanner(title, sub = '', ms = 3400) {
+    els.bannerTitle.textContent = title;
+    els.bannerSub.textContent = sub;
+    els.banner.classList.add('show');
+    window.clearTimeout(bannerTimer);
+    bannerTimer = window.setTimeout(() => els.banner.classList.remove('show'), ms);
+    announce(title + (sub ? `. ${sub}` : ''));
+  }
+
+  function startNew() {
+    clearSave();
+    game = createGame(gameSeed);
+    mode = 'play';
+    els.title.classList.add('hidden');
+    showBanner('PORT SOLANO', 'Find Marisol Vega — she waits by the Playa promenade.');
+  }
+
+  function startContinue() {
+    const data = loadSaveData();
+    game = createGame(gameSeed);
+    if (data) applySave(game, data);
+    mode = 'play';
+    els.title.classList.add('hidden');
+    showBanner('Welcome back', 'Your story in Solano continues.');
+  }
+
+  els.btnNew.addEventListener('click', () => { game.audio?.unlock(); startNew(); });
+  els.btnContinue.addEventListener('click', () => { game.audio?.unlock(); startContinue(); });
+  if (!loadSaveData()) els.btnContinue.disabled = true;
+  $('shop-close').addEventListener('click', () => { game.menu = null; });
+  canvas.addEventListener('pointerdown', () => game.audio?.unlock(), { once: true });
+  window.addEventListener('keydown', () => game.audio?.unlock(), { once: true });
+
+  // --- Shop DOM -------------------------------------------------------------
+  function buildShop() {
+    builtMenu = game.menu;
+    els.shopItems.innerHTML = '';
+    els.shopCash.textContent = `$${game.cash}`;
+    const row = (label, detail, price, enabled, onBuy) => {
+      const div = document.createElement('div');
+      div.className = 'shop-row';
+      const left = document.createElement('div');
+      left.innerHTML = `<strong></strong><span></span>`;
+      left.querySelector('strong').textContent = label;
+      left.querySelector('span').textContent = detail;
+      const btn = document.createElement('button');
+      btn.textContent = price;
+      btn.disabled = !enabled;
+      btn.addEventListener('click', () => { onBuy(); buildShop(); syncHud(); });
+      div.append(left, btn);
+      els.shopItems.append(div);
+    };
+    if (game.menu === 'gun') {
+      els.shopTitle.textContent = 'Armas Solano';
+      for (const key of WEAPON_ORDER) {
+        if (key === 'fists') continue;
+        const spec = WEAPONS[key];
+        if (!game.weaponsOwned[key]) {
+          row(spec.name, `New — includes ${AMMO_PACK} rounds`, `$${spec.price}`, game.cash >= spec.price, () => buyWeapon(game, key));
+        } else {
+          row(`${spec.name} ammo`, `You carry ${game.ammo[key]} rounds`, `$${spec.ammoPrice}`, game.cash >= spec.ammoPrice, () => buyAmmo(game, key));
+        }
+      }
+      row('Chaleco antibalas', game.armor >= 100 ? 'Armor is full' : `Body armor — now ${Math.round(game.armor)}%`, `$${Math.max(40, Math.ceil(((100 - game.armor) / 100) * ARMOR_PRICE))}`, game.armor < 100 && game.cash >= 40, () => buyArmor(game));
+    } else if (game.menu === 'customs' && game.menuCar) {
+      const car = game.menuCar;
+      els.shopTitle.textContent = 'Solano Customs';
+      const missing = Math.ceil(car.maxHp - car.hp);
+      row('Repair', missing > 0 ? `${missing} points of damage` : 'No damage', missing > 0 ? `$${Math.ceil(missing * MONEY.repairPerHp)}` : '—', missing > 0, () => repairCar(game, car));
+      for (const color of CAR_COLORS) {
+        row('Repaint', 'Fresh paint, no questions', `$${MONEY.repaintPrice}`, game.cash >= MONEY.repaintPrice && car.color !== color, () => repaintCar(game, car, color));
+        const swatch = document.createElement('span');
+        swatch.className = 'swatch';
+        swatch.style.background = color;
+        els.shopItems.lastChild.querySelector('strong').prepend(swatch);
+      }
+    }
+  }
+
+  // --- HUD sync ---------------------------------------------------------------
+  const hudCache = new Map();
+  function setText(el, key, value) {
+    if (hudCache.get(key) !== value) { hudCache.set(key, value); el.textContent = value; }
+  }
+  function syncHud() {
+    setText(els.cash, 'cash', `$${game.cash}`);
+    const hh = Math.floor(game.tod / 60);
+    const mm = Math.floor(game.tod % 60);
+    setText(els.clock, 'clock', `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')} · ${DISTRICTS[game.district]}`);
+    const stars = game.wanted.stars;
+    setText(els.stars, 'stars', '★'.repeat(stars) + '☆'.repeat(5 - stars));
+    els.stars.classList.toggle('hot', stars > 0);
+    els.hpFill.style.width = `${Math.max(0, game.player.hp)}%`;
+    els.armorFill.style.width = `${Math.max(0, game.armor)}%`;
+    const spec = WEAPONS[game.weapon];
+    setText(els.weapon, 'weapon', game.weapon === 'fists' ? 'Fists' : `${spec.name} · ${game.ammo[game.weapon]}`);
+    setText(els.packages, 'packages', `📦 ${game.packagesFound} / 20 paquetes`);
+    setText(els.objective, 'objective', game.objectiveText || '');
+    if (game.vehicle) {
+      els.radio.classList.remove('hidden');
+      setText(els.radio, 'radio', `📻 ${game.audio.stationName()} — [R] cambia`);
+    } else {
+      els.radio.classList.add('hidden');
+    }
+    const bust = game.wanted.bust;
+    els.bustWrap.classList.toggle('hidden', bust <= 0.02);
+    if (bust > 0.02) els.bustFill.style.width = `${Math.round(bust * 100)}%`;
+    if (game.dialogue) {
+      const line = game.dialogue.lines[game.dialogue.i];
+      els.dialogue.classList.remove('hidden');
+      if (line) {
+        setText(els.dlgWho, 'who', line.who);
+        setText(els.dlgText, 'text', line.text);
+      }
+    } else {
+      els.dialogue.classList.add('hidden');
+    }
+    // Overlays.
+    els.shop.classList.toggle('hidden', !game.menu);
+    if (game.menu && builtMenu !== game.menu) buildShop();
+    if (!game.menu) builtMenu = null;
+    if (game.over && !wasOver) {
+      wasOver = true;
+      const busted = game.over.kind === 'busted';
+      els.overTitle.textContent = busted ? 'ARRESTED' : 'DOWNED';
+      const bill = Math.min(game.cash, busted ? MONEY.bustFine : MONEY.hospitalBill);
+      els.overSub.textContent = busted
+        ? `The Comisaría Central keeps $${bill} for its trouble. Your record is clean — for now.`
+        : `You wake up at Hospital San Solano. The bill comes to $${bill} — the bay is still out there.`;
+      els.over.classList.remove('hidden');
+      announce(els.overTitle.textContent);
+    } else if (!game.over && wasOver) {
+      wasOver = false;
+      els.over.classList.add('hidden');
+    }
+    els.pause.classList.toggle('hidden', mode !== 'paused');
+  }
+
+  function handleFlags() {
+    const f = game.flags;
+    if (f.missionFailed) showBanner('MISSION FAILED', 'Return to the marker to try again.');
+    if (f.missionDone) showBanner('MISSION COMPLETE', f.missionDone);
+    if (f.storyComplete) showBanner('LA HISTORIA TERMINA', 'El Pulpo is finished. Solano is yours — the bay stays open.', 6000);
+    if (f.raceWon) showBanner(f.raceWon.name.toUpperCase(), `Finished in ${f.raceWon.t.toFixed(1)}s — $${f.raceWon.prize} prize.`);
+    if (f.raceSlow) showBanner('TOO SLOW', `${f.raceSlow} pays only inside the time. Run it again.`);
+    if (f.raceLost) showBanner('RACE ABANDONED', `${f.raceLost} — the checkpoints went cold.`);
+    if (f.courierFailed) showBanner('DELIVERY FAILED', 'The package is late. The spots pay again tomorrow.');
+    if (f.taxiLost) showBanner('FARE LOST', 'No cab, no fare. The next passenger is already waiting.');
+  }
+
+  // --- Shot mode ---------------------------------------------------------------
+  if (shotName) {
+    const scene = stageShot(game, shotName, stepGame);
+    game.flags = {};
+    syncHud();
+    els.title.classList.toggle('hidden', scene.screen !== 'title');
+    let painted = 0;
+    const paint = () => {
+      renderer.draw(game);
+      minimap.draw(game);
+      painted += 1;
+      if (painted < 2) requestAnimationFrame(paint);
+      else window.__shotReady = true;
+    };
+    requestAnimationFrame(paint);
+  } else {
+    // --- The live loop ---------------------------------------------------------
+    els.title.classList.remove('hidden');
+    let accumulator = 0;
+    let last = performance.now();
+    const frame = (now) => {
+      requestAnimationFrame(frame);
+      accumulator += Math.min((now - last) / 1000, MAX_FRAME);
+      last = now;
+      game.flags = {};
+      if (mode === 'play') {
+        let sample = input.poll(game.player);
+        if (sample.pause && !game.menu && !game.dialogue) {
+          mode = 'paused';
+          accumulator = 0;
+        } else {
+          while (accumulator >= STEP && mode === 'play') {
+            stepGame(game, sample, STEP);
+            accumulator -= STEP;
+            sample = {
+              ...sample,
+              interact: false, confirm: false, pause: false, weaponSlot: 0,
+              radioNext: false, radioPrev: false, mute: false,
+            };
+          }
+        }
+      } else {
+        accumulator = 0;
+        if (mode === 'paused') {
+          const sample = input.poll(game.player);
+          if (sample.pause || sample.confirm) mode = 'play';
+        }
+      }
+      handleFlags();
+      renderer.draw(game);
+      minimap.draw(game);
+      syncHud();
+    };
+    requestAnimationFrame(frame);
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden && mode === 'play') mode = 'paused';
+    });
+  }
+}
