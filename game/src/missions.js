@@ -8,6 +8,12 @@
 
 import { PRICES, WEAPONS } from './config.js';
 import { createVehicle, createPed, createBoat, circleBlocked } from './entities.js';
+import { RNG } from './random.js';
+
+// The job desk's dice. Gameplay randomness only (courier destinations):
+// seeded from the wall clock at load and never shared with the city
+// generator's stream, so the seeded city is untouched by it.
+const jobRng = new RNG((Math.random() * 0x100000000) >>> 0);
 
 // ------------------------------------------------------------- the story
 export const MISSIONS = [
@@ -470,8 +476,10 @@ export function startCourier(state, fromSpot) {
   const c = state.courier, city = state.city;
   // the far half of the spot list makes for honest cross-city runs
   const options = city.courierSpots.filter((s) => Math.hypot(s.x - fromSpot.x, s.y - fromSpot.y) > 1400);
-  const dest = options.length ? options[Math.floor(Math.random() * options.length)]
-    : city.courierSpots[Math.floor(Math.random() * city.courierSpots.length)];
+  const pool = options.length ? options : city.courierSpots;
+  // Pay grows with distance, so the desk weights the draw by it: the
+  // longest hauls in the pool come up most often, short hops least.
+  const dest = jobRng.pickWeighted(pool.map((s) => [s, Math.hypot(s.x - fromSpot.x, s.y - fromSpot.y)]));
   const dist = Math.hypot(dest.x - fromSpot.x, dest.y - fromSpot.y);
   c.dest = { x: dest.x, y: dest.y }; c.destName = dest.name;
   c.totalTime = c.timeLeft = 45 + dist / 26;

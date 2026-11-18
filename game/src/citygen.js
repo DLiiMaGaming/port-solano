@@ -391,11 +391,10 @@ export function generateCity(seed) {
       }
     }
     // Shuffle with rng2 so capped props spread over the whole map instead
-    // of clustering in the first rows the scan reaches.
-    for (let i = candidates.length - 1; i > 0; i--) {
-      const j = rng2.int(0, i);
-      const tmp = candidates[i]; candidates[i] = candidates[j]; candidates[j] = tmp;
-    }
+    // of clustering in the first rows the scan reaches. RNG.shuffle makes
+    // the same draws in the same order this pass always made inline, so
+    // the scattered props — hues included — come out identical.
+    rng2.shuffle(candidates);
     let placed = 0;
     for (const [tx, ty] of candidates) {
       if (placed >= cap) break;

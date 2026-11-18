@@ -8,11 +8,12 @@
 //   ?shot=drive  morning traffic in Centro, player at the wheel
 //   ?shot=chase  a three-star pursuit on the harbour avenues
 //   ?shot=docks  the Almacén Pulpo shootout, staged on foot
+//   ?shot=boat   a three-star harbour chase: speedboat vs patrol boat
 
 import { WEAPONS } from './config.js';
-import { createVehicle, createPed } from './entities.js';
+import { createVehicle, createPed, createBoat } from './entities.js';
 
-export const SHOT_NAMES = ['start', 'drive', 'chase', 'docks'];
+export const SHOT_NAMES = ['start', 'drive', 'chase', 'docks', 'boat'];
 
 export function setupShot(state, name) {
   const city = state.city;
@@ -72,6 +73,32 @@ export function setupShot(state, name) {
     state.cars.push(civ);
     return;
   }
+  if (name === 'boat') {
+    state.clock = 18.45; // golden hour on the harbour
+    // Take the moored speedboat off the El Puerto front (the first
+    // speedboat in the fleet the city moored at boot) and put the player
+    // at its helm in the basin's open water, already making way.
+    const boat = state.boats.find((b) => b.kind === 'moored' && b.type === 'speedboat');
+    boat.hp = boat.maxHp = 800; // posed tough, like the chase car: the
+    // patrol boat shoots from 3 stars, and the flight must still be
+    // afloat — not a smoking wreck — when the shutter falls
+    state.player.maxHp = 400; state.player.hp = 400; // same insurance
+    boat.x = 5980; boat.y = 7520; boat.angle = Math.PI;
+    enterBoat(state, boat);
+    boat.vx = -150;
+    state.wanted.heat = 140; // three stars
+    // The patrol boat, staged in the same basin: the harbour basins are
+    // sealed off from each other by the causeway decks, and the patrol's
+    // off-screen spawn ring (560–760px out) would land it behind one of
+    // those decks from anywhere in this basin, beached before it ever
+    // came into frame. So the scene places it the way police.js itself
+    // builds it — same hull, same Patrulla colours — a few lengths off
+    // the player's quarter, and from the first frame updatePoliceBoat
+    // has its helm: it runs the player down and shoots for real.
+    const patrol = createBoat(city, 'speedboat', 5620, 7440, 0, { kind: 'police', color: '#274268' });
+    state.boats.push(patrol);
+    return;
+  }
   if (name === 'docks') {
     state.clock = 9.1;
     const at = city.spots.pulpoYard;
@@ -106,6 +133,12 @@ function enterCar(state, car) {
   state.player.angle = car.angle;
 }
 
+function enterBoat(state, boat) {
+  state.player.inBoat = boat;
+  state.player.x = boat.x; state.player.y = boat.y;
+  state.player.angle = boat.angle;
+}
+
 // A tiny driver that holds keys and aims the mouse for the posed scenes.
 export function createShotDriver(state, name) {
   const driver = {
@@ -113,11 +146,17 @@ export function createShotDriver(state, name) {
     update(t) {
       const keys = driver.input.keys;
       keys.clear();
-      if (name === 'drive' || name === 'chase') {
+      if (name === 'drive' || name === 'chase' || name === 'boat') {
         keys.add('KeyW');
         if (name === 'drive') {
           const weave = Math.sin(t * 0.7) > 0.55 ? 'KeyA' : (Math.sin(t * 0.7) < -0.55 ? 'KeyD' : null);
           if (weave) keys.add(weave);
+        }
+        if (name === 'boat') {
+          // A held helm: in a sealed basin the only way to keep way on
+          // is to run a turning circle, so the speedboat circles with
+          // its wake up while the patrol boat cuts across after it.
+          keys.add('KeyA');
         }
         // The chase holds a straight line down the avenue. Any sustained
         // steering swings the fleeing car off the road and into the
