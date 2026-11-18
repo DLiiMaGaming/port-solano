@@ -7,7 +7,7 @@
 // state.mission.marker for the world renderer and the minimap.
 
 import { PRICES, WEAPONS } from './config.js';
-import { createVehicle, createPed } from './entities.js';
+import { createVehicle, createPed, createBoat, circleBlocked } from './entities.js';
 
 // ------------------------------------------------------------- the story
 export const MISSIONS = [
@@ -86,6 +86,34 @@ export const MISSIONS = [
     ],
   },
   {
+    id: 'marea', title: 'Marea Nocturna', giver: 'Marisol Vega', giverSpot: 'customsDock',
+    reward: 850,
+    intro: [
+      { who: 'Marisol Vega', text: 'One last quiet job, sobrino. A package must cross the bay tonight — by water, where the Patrulla has no eyes.' },
+      { who: 'Marisol Vega', text: 'Take any boat from the docks and run it to Isla Brisa. My people wait on the island shore. The package is already aboard whichever boat you choose — do not ask.' },
+      { who: 'Tú', text: 'A boat ride at night with a mystery package. What could go wrong, tía.' },
+    ],
+    objective: { type: 'boatrun', label: 'Run the package by boat from El Puerto to Isla Brisa' },
+    outro: [
+      { who: 'Contacto de Brisa', text: 'Clean crossing. Marisol pays well for quiet water, amigo.' },
+      { who: 'Marisol Vega', text: 'The bay works for us now, on road and on water. Remember that feeling — we will need it.' },
+    ],
+  },
+  {
+    id: 'isla', title: 'La Isla del Pulpo', giver: 'Dario', giverSpot: 'darioHouse',
+    reward: 1600,
+    intro: [
+      { who: 'Dario', text: 'Primo. El Pulpo ran to Isla Brisa with what is left of his crew. Six men and that red Cigarrera he loves more than his own mother.' },
+      { who: 'Dario', text: 'End it there. Clear the island, sink his boat, and come home. However you get there is your business — road, bridge or water.' },
+      { who: 'Tú', text: 'Consider the island ours, primo.' },
+    ],
+    objective: { type: 'islandraid', spot: 'island', hostiles: 6, drop: 'darioHouse', label: 'Clear El Pulpo’s crew on Isla Brisa and wreck his speedboat' },
+    outro: [
+      { who: 'Dario', text: 'The island, primo! You took the man’s island and his boat. There is nothing left of El Pulpo but a story.' },
+      { who: 'Marisol Vega', text: 'One shadow remains, sobrino. When you are ready, come home and we finish the man himself.' },
+    ],
+  },
+  {
     id: 'ajuste', title: 'Ajuste de Cuentas', giver: 'Marisol Vega', giverSpot: 'darioHouse',
     reward: 1500,
     intro: [
@@ -102,7 +130,7 @@ export const MISSIONS = [
 
 // ------------------------------------------------------------ state machine
 export function createStory() {
-  return { index: 0, phase: 'idle', step: 0, timer: 0, hostiles: [], targetCar: null, extraCars: [], checkIdx: 0, checkpoints: [] };
+  return { index: 0, phase: 'idle', step: 0, timer: 0, hostiles: [], targetCar: null, targetBoat: null, extraCars: [], checkIdx: 0, checkpoints: [] };
 }
 
 export function currentMission(story) { return MISSIONS[story.index] || null; }
@@ -116,11 +144,40 @@ export function startMission(state) {
   if (state.audio) state.audio.uiClick();
 }
 
+// Staging must never put a man or a car inside a building or in the
+// sea: the ring around a yard spot can overlap the warehouse wall (or,
+// on Isla Brisa, the water). Walk the spawn point toward the spot
+// centre until it stands on open ground.
+function stagePoint(city, at, x, y, r) {
+  let cx = at.x, cy = at.y;
+  if (circleBlocked(city, cx, cy, r)) {
+    // the anchor itself is unusable ground (the Isla Brisa spot sits in
+    // the island's water channel): stage around the nearest open ground
+    outer: for (let rad = 24; rad <= 230; rad += 24) {
+      for (let i = 0; i < 12; i++) {
+        const a = (i / 12) * Math.PI * 2;
+        const px = at.x + Math.cos(a) * rad, py = at.y + Math.sin(a) * rad;
+        if (!circleBlocked(city, px, py, r)) { cx = px; cy = py; break outer; }
+      }
+    }
+  }
+  for (let i = 0; i < 28 && circleBlocked(city, x, y, r); i++) {
+    x += (cx - x) * 0.25; y += (cy - y) * 0.25;
+  }
+  return { x, y };
+}
+function stagePed(state, at, x, y, opts) {
+  const pt = stagePoint(state.city, at, x, y, 10);
+  const ped = createPed(pt.x, pt.y, opts);
+  state.peds.push(ped);
+  return ped;
+}
+
 // Called by main.js when the intro dialogue closes.
 export function activateMission(state) {
   const s = state.story, m = currentMission(s);
   if (!m) return;
-  s.phase = 'active'; s.step = 0; s.hostiles = []; s.extraCars = []; s.targetCar = null;
+  s.phase = 'active'; s.step = 0; s.hostiles = []; s.extraCars = []; s.targetCar = null; s.targetBoat = null;
   const o = m.objective, city = state.city;
   if (o.type === 'steal') {
     const at = city.spots[o.carAt];
@@ -131,16 +188,29 @@ export function activateMission(state) {
     const at = city.spots[o.spot];
     for (let i = 0; i < o.hostiles; i++) {
       const a = (i / o.hostiles) * 6.28;
-      const ped = createPed(at.x + Math.cos(a) * (60 + (i % 3) * 36), at.y + Math.sin(a) * (60 + (i % 3) * 36),
+      const ped = stagePed(state, at, at.x + Math.cos(a) * (60 + (i % 3) * 36), at.y + Math.sin(a) * (60 + (i % 3) * 36),
         { hostile: true, weapon: WEAPONS.pistol, hp: 55, cashDrop: 18 + i * 4 });
-      state.peds.push(ped); s.hostiles.push(ped);
+      s.hostiles.push(ped);
     }
     if (o.type === 'finale') {
       for (let i = 0; i < (o.cars || 0); i++) {
-        const car = createVehicle(city, i ? 'muscle' : 'pickup', at.x - 70 + i * 90, at.y - 90, 0.2, { kind: 'mission', marked: true });
+        const pt = stagePoint(city, at, at.x - 70 + i * 90, at.y - 90, 20);
+        const car = createVehicle(city, i ? 'muscle' : 'pickup', pt.x, pt.y, 0.2, { kind: 'mission', marked: true });
         state.cars.push(car); s.extraCars.push(car);
       }
     }
+  }
+  if (o.type === 'islandraid') {
+    const at = city.spots[o.spot];
+    for (let i = 0; i < o.hostiles; i++) {
+      const a = (i / o.hostiles) * 6.28;
+      const ped = stagePed(state, at, at.x + Math.cos(a) * (70 + (i % 3) * 40), at.y + Math.sin(a) * (70 + (i % 3) * 40),
+        { hostile: true, weapon: WEAPONS.pistol, hp: 55, cashDrop: 18 + i * 4 });
+      s.hostiles.push(ped);
+    }
+    // El Pulpo's beloved Cigarrera, tied up on the island's north shore
+    const boat = createBoat(city, 'speedboat', 4400, 7440, 0, { kind: 'mission', marked: true, color: '#9d0208' });
+    state.boats.push(boat); s.targetBoat = boat;
   }
   if (o.type === 'checkpoints') {
     s.checkpoints = city.raceCheckpoints.slice(0, o.count);
@@ -164,6 +234,8 @@ export function publishMarker(state) {
     else if (o.type === 'shootout') marker = city.spots[o.spot];
     else if (o.type === 'escape') marker = city.spots[s.step === 0 ? o.pickup : o.drop];
     else if (o.type === 'checkpoints') marker = s.checkpoints[s.checkIdx] || null;
+    else if (o.type === 'boatrun') marker = s.step === 0 ? city.spots.boatDock : (s.step === 1 ? city.spots.islandDock : city.spots.island);
+    else if (o.type === 'islandraid') marker = s.step === 0 ? city.spots[o.spot] : city.spots[o.drop];
     else if (o.type === 'finale') marker = s.step === 0 ? city.spots[o.spot] : city.spots[o.drop];
   }
   state.mission.marker = marker;
@@ -187,7 +259,7 @@ export function rewardMission(state) {
   state.floaters.push({ x: state.player.x, y: state.player.y - 30, text: '+$' + reward, life: 1.8, color: '#ffd23e' });
   if (state.audio) { state.audio.jingle(true); state.audio.cash(); }
   state.banner = { title: 'Mission complete', sub: m.title + '  ·  $' + reward, t: 3.4 };
-  s.index++; s.phase = 'idle'; s.hostiles = []; s.targetCar = null; s.extraCars = [];
+  s.index++; s.phase = 'idle'; s.hostiles = []; s.targetCar = null; s.targetBoat = null; s.extraCars = [];
   if (!currentMission(s)) state.banner = { title: 'Story complete', sub: 'Port Solano is yours — free roam', t: 4.5 };
   state.saveGame();
   publishMarker(state);
@@ -200,9 +272,10 @@ export function failMission(state) {
   for (const p of s.hostiles) p.removeMe = true;
   state.peds = state.peds.filter((p) => !p.removeMe);
   if (s.targetCar && !s.targetCar.dead) s.targetCar.removeMe = true;
+  if (s.targetBoat && !s.targetBoat.dead) s.targetBoat.removeMe = true;
   for (const c of s.extraCars) if (!c.dead) c.removeMe = true;
   state.cars = state.cars.filter((c) => !c.removeMe);
-  s.phase = 'idle'; s.hostiles = []; s.targetCar = null; s.extraCars = [];
+  s.phase = 'idle'; s.hostiles = []; s.targetCar = null; s.targetBoat = null; s.extraCars = [];
   state.banner = { title: 'Mission failed', sub: 'Return to the marker to try again', t: 3 };
   publishMarker(state);
 }
@@ -262,6 +335,23 @@ export function updateMission(state, dt) {
       state.floaters.push({ x: player.x, y: player.y - 26, text: 'Checkpoint ' + s.checkIdx + '/' + s.checkpoints.length, life: 1.4, color: '#7ec3ee' });
       if (s.checkIdx >= s.checkpoints.length) completeObjective(state);
     }
+  } else if (o.type === 'boatrun') {
+    if (s.step === 0 && player.inBoat) {
+      s.step = 1;
+      state.floaters.push({ x: player.x, y: player.y - 26, text: 'The package is aboard — Isla Brisa, across the bay', life: 2.2, color: '#ffd23e' });
+      if (state.audio) state.audio.pickup();
+    } else if (s.step === 1 && player.inBoat && near(player, city.spots.islandDock, 110)) {
+      s.step = 2;
+      state.floaters.push({ x: player.x, y: player.y - 26, text: 'Step ashore and meet the contact', life: 2, color: '#ffd23e' });
+    } else if (s.step === 2 && !player.inBoat && near(player, city.spots.island, 70)) {
+      completeObjective(state);
+    }
+  } else if (o.type === 'islandraid') {
+    if (s.step === 0 && s.hostiles.every((p) => p.dead) && s.targetBoat && s.targetBoat.dead) {
+      s.step = 1;
+      state.wanted.heat = Math.max(state.wanted.heat, 130);
+      state.floaters.push({ x: player.x, y: player.y - 26, text: 'The island is ours — now get home!', life: 2, color: '#ffd23e' });
+    } else if (s.step === 1 && near(player, city.spots[o.drop], 66)) completeObjective(state);
   } else if (o.type === 'finale') {
     if (s.step === 0 && s.hostiles.every((p) => p.dead) && s.extraCars.every((c) => c.dead)) {
       s.step = 1;
@@ -322,13 +412,25 @@ export function updateTaxi(state, dt) {
 }
 
 // ------------------------------------------------------------------- race
-export function createRace() { return { active: false, checkpoints: [], next: 0, timeLeft: 0 }; }
+export function createRace() { return { active: false, name: '', checkpoints: [], next: 0, timeLeft: 0, prize: 0 }; }
 
 export function startRace(state) {
   const r = state.race;
+  r.name = 'Harbour Run'; r.prize = PRICES.racePrize;
   r.checkpoints = state.city.raceCheckpoints;
   r.next = 0; r.timeLeft = 175; r.active = true;
   state.banner = { title: 'Harbour Run', sub: 'Hit every checkpoint before the clock dies', t: 3 };
+  if (state.audio) state.audio.jingle(false);
+}
+
+// The second race: out of the harbour, down the causeway, across Isla
+// Brisa's sand and back over the bridge. Longer, wilder, better paid.
+export function startRace2(state) {
+  const r = state.race;
+  r.name = 'Isla Loop'; r.prize = PRICES.race2Prize;
+  r.checkpoints = state.city.islaCheckpoints;
+  r.next = 0; r.timeLeft = 150; r.active = true;
+  state.banner = { title: 'Isla Loop', sub: 'Causeway, island sand and back — beat the clock', t: 3 };
   if (state.audio) state.audio.jingle(false);
 }
 
@@ -338,7 +440,7 @@ export function updateRace(state, dt) {
   r.timeLeft -= dt;
   if (r.timeLeft <= 0) {
     r.active = false;
-    state.banner = { title: 'Out of time', sub: 'The Harbour Run resets at the harbour marker', t: 3 };
+    state.banner = { title: 'Out of time', sub: 'The ' + r.name + ' resets at its start marker', t: 3 };
     if (state.audio) state.audio.jingle(false);
     return;
   }
@@ -348,9 +450,53 @@ export function updateRace(state, dt) {
     if (state.audio) state.audio.pickup();
     if (r.next >= r.checkpoints.length) {
       r.active = false;
-      state.player.cash += PRICES.racePrize;
-      state.banner = { title: 'Harbour Run complete!', sub: '+$' + PRICES.racePrize + ' — the harbour bows to you', t: 3.6 };
+      state.player.cash += r.prize;
+      state.banner = { title: r.name + ' complete!', sub: '+$' + r.prize + ' — the bay bows to you', t: 3.6 };
       if (state.audio) { state.audio.jingle(true); state.audio.cash(); }
     }
+  }
+}
+
+// ----------------------------------------------------------------- courier
+// The side job with a satchel: walk up to any courier spot (the terminal,
+// the hotel, the plaza, the warehouse, the Comisaría, the beach stand)
+// and press E — a package is thrust into your hands with a destination
+// across the city and a clock already running. Pay scales with the
+// distance; what is left of the clock comes back as a speed bonus.
+// Any wheels — or hull — will do. Repeatable forever.
+export function createCourier() { return { active: false, dest: null, destName: '', timeLeft: 0, totalTime: 0, pay: 0 }; }
+
+export function startCourier(state, fromSpot) {
+  const c = state.courier, city = state.city;
+  // the far half of the spot list makes for honest cross-city runs
+  const options = city.courierSpots.filter((s) => Math.hypot(s.x - fromSpot.x, s.y - fromSpot.y) > 1400);
+  const dest = options.length ? options[Math.floor(Math.random() * options.length)]
+    : city.courierSpots[Math.floor(Math.random() * city.courierSpots.length)];
+  const dist = Math.hypot(dest.x - fromSpot.x, dest.y - fromSpot.y);
+  c.dest = { x: dest.x, y: dest.y }; c.destName = dest.name;
+  c.totalTime = c.timeLeft = 45 + dist / 26;
+  c.pay = Math.round(25 + dist * 0.022);
+  c.active = true;
+  state.floaters.push({ x: state.player.x, y: state.player.y - 28, text: '📦 Deliver to ' + dest.name + ' — $' + c.pay + ', clock running', life: 2.6, color: '#7ec3ee' });
+  if (state.audio) state.audio.pickup();
+}
+
+export function updateCourier(state, dt) {
+  const c = state.courier;
+  if (!c.active) return;
+  c.timeLeft -= dt;
+  if (c.timeLeft <= 0) {
+    c.active = false;
+    state.banner = { title: 'Delivery failed', sub: 'The package for ' + c.destName + ' went cold', t: 3 };
+    if (state.audio) state.audio.jingle(false);
+    return;
+  }
+  if (near(state.player, c.dest, 62)) {
+    const bonus = Math.floor(c.pay * 0.5 * (c.timeLeft / c.totalTime));
+    const total = c.pay + bonus;
+    state.player.cash += total;
+    c.active = false;
+    state.floaters.push({ x: state.player.x, y: state.player.y - 28, text: '📦 Delivered! $' + c.pay + (bonus ? ' + speed $' + bonus : ''), life: 2.4, color: '#57e389' });
+    if (state.audio) { state.audio.cash(); state.audio.jingle(true); }
   }
 }

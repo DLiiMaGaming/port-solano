@@ -5,7 +5,7 @@
 // they are pushed onto state.events and the wanted system (police.js)
 // decides who saw what.
 
-import { TILE, T, VEHICLE_TYPES, MAX_PARTICLES, MAX_SKIDS } from './config.js';
+import { TILE, T, VEHICLE_TYPES, BOAT_TYPES, MAX_PARTICLES, MAX_SKIDS } from './config.js';
 
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 const dist2 = (ax, ay, bx, by) => { const dx = ax - bx, dy = ay - by; return dx * dx + dy * dy; };
@@ -46,6 +46,28 @@ export function moveCircle(city, o, r, nx, ny) {
   let hitX = false, hitY = false;
   if (!circleBlocked(city, nx, o.y, r)) o.x = nx; else hitX = true;
   if (!circleBlocked(city, o.x, ny, r)) o.y = ny; else hitY = true;
+  return { hitX, hitY };
+}
+
+// The mirror image for boats: a hull is blocked by everything that is
+// NOT open water — land tiles of every kind, the bridge deck (boats do
+// not pass under the causeway) and the city's solid AABBs.
+export function circleBlockedLand(city, x, y, r) {
+  const tx0 = Math.floor((x - r) / TILE), tx1 = Math.floor((x + r) / TILE);
+  const ty0 = Math.floor((y - r) / TILE), ty1 = Math.floor((y + r) / TILE);
+  for (let ty = ty0; ty <= ty1; ty++) for (let tx = tx0; tx <= tx1; tx++) {
+    if (city.tileAt(tx, ty) !== T.WATER) return true;
+  }
+  for (const s of city.solids) {
+    if (x + r > s.x && x - r < s.x + s.w && y + r > s.y && y - r < s.y + s.h) return true;
+  }
+  return x - r < 0 || y - r < 0 || x + r > city.tiles.length / 240 * TILE || y + r > 240 * TILE;
+}
+
+export function moveCircleWater(city, o, r, nx, ny) {
+  let hitX = false, hitY = false;
+  if (!circleBlockedLand(city, nx, o.y, r)) o.x = nx; else hitX = true;
+  if (!circleBlockedLand(city, o.x, ny, r)) o.y = ny; else hitY = true;
   return { hitX, hitY };
 }
 
@@ -162,6 +184,105 @@ export function damageCar(state, car, amount, cause) {
       state.events.push({ kind: 'crime', crime: 'killCop', x: car.x, y: car.y, certain: true });
     }
   }
+}
+
+// ------------------------------------------------------------------ boats
+// Watercraft share the cars' velocity decomposition but live by the
+// opposite collision rule (water only), steer wide and slide long, and
+// trail a foam wake. kind: 'moored' (tied up, boardable), 'police'
+// (the harbour patrol — its AI lives in police.js) or 'mission'.
+let nextBoatId = 1;
+export function createBoat(city, type, x, y, angle, opts = {}) {
+  const def = BOAT_TYPES[type];
+  return {
+    id: nextBoatId++, kind: opts.kind || 'moored', type, def,
+    x, y, angle, vx: 0, vy: 0, speed: 0,
+    hp: def.durability, maxHp: def.durability,
+    color: opts.color || def.colors[Math.floor(Math.random() * def.colors.length)],
+    dead: false, smokeT: 0, wreckT: 0, marked: !!opts.marked,
+    bobPhase: Math.random() * 6.28, fireT: 0, leaving: false,
+  };
+}
+
+export function boatSpeed(boat) { return Math.hypot(boat.vx, boat.vy); }
+
+// One physics step on water. ctrl = { throttle: -1..1, steer: -1..1 }.
+export function stepBoat(state, boat, ctrl, dt) {
+  const def = boat.def;
+  const fx = Math.cos(boat.angle), fy = Math.sin(boat.angle);
+  let vf = boat.vx * fx + boat.vy * fy;
+  let vlx = boat.vx - vf * fx, vly = boat.vy - vf * fy;
+  const healthF = 0.55 + 0.45 * (boat.hp / boat.maxHp);
+  const top = def.topSpeed * healthF;
+
+  if (boat.dead) ctrl = { throttle: 0, steer: 0 };
+  if (ctrl.throttle > 0) vf += def.accel * ctrl.throttle * dt * (vf < 0 ? 2.2 : 1);
+  else if (ctrl.throttle < 0) vf -= def.accel * 0.8 * dt;
+  vf -= vf * 0.62 * dt;                                   // water drag
+  vf = clamp(vf, -def.reverse, Math.max(top, 0));
+  if (!ctrl.throttle && Math.abs(vf) < 3) vf = 0;
+
+  // boats answer the helm slowly, and only while they have way on
+  const steerAuthority = clamp(Math.abs(vf) / 55, 0, 1);
+  boat.angle += ctrl.steer * def.turn * steerAuthority * dt * (vf < 0 ? -1 : 1);
+  const keep = Math.exp(-def.grip * dt);                  // long, lazy slide
+  vlx *= keep; vly *= keep;
+
+  const nfx = Math.cos(boat.angle), nfy = Math.sin(boat.angle);
+  boat.vx = nfx * vf + vlx; boat.vy = nfy * vf + vly;
+  boat.speed = vf;
+
+  const nx = boat.x + boat.vx * dt, ny = boat.y + boat.vy * dt;
+  const before = Math.hypot(boat.vx, boat.vy);
+  const hit = moveCircleWater(state.city, boat, def.h * 0.95, nx, ny);
+  if (hit.hitX) boat.vx = 0;
+  if (hit.hitY) boat.vy = 0;
+  if ((hit.hitX || hit.hitY) && before > 110) {
+    damageBoat(state, boat, before * 0.07, 'crash');
+    spawnParticles(state, 'splash', boat.x + nfx * def.w * 0.5, boat.y + nfy * def.w * 0.5, 8);
+    if (state.audio) state.audio.crash(clamp(before / 380, 0.2, 0.8));
+    state.shake = Math.min(12, state.shake + before * 0.015);
+  }
+
+  // the wake: foam at the stern while the boat has way on
+  if (Math.abs(vf) > 42 && !boat.dead) {
+    const sx = boat.x - nfx * def.w * 0.5, sy = boat.y - nfy * def.w * 0.5;
+    if (Math.random() < 0.75) spawnParticles(state, 'wake', sx, sy, 1);
+    if (Math.random() < 0.3) spawnParticles(state, 'splash', sx, sy, 1);
+  }
+  if (boat.hp < boat.maxHp * 0.35 && !boat.dead) {
+    boat.smokeT -= dt;
+    if (boat.smokeT <= 0) { boat.smokeT = 0.14; spawnParticles(state, 'smoke', boat.x + nfx * 10, boat.y + nfy * 10, 1); }
+  }
+  boat.bobPhase += dt * 1.7;
+  return boat;
+}
+
+export function damageBoat(state, boat, amount, cause) {
+  if (boat.dead) return;
+  boat.hp -= amount;
+  if (boat.hp <= 0) {
+    boat.hp = 0; boat.dead = true; boat.wreckT = 0;
+    spawnParticles(state, 'fire', boat.x, boat.y, 14);
+    spawnParticles(state, 'smoke', boat.x, boat.y, 12);
+    spawnParticles(state, 'splash', boat.x, boat.y, 12);
+    if (state.audio) state.audio.crash(0.9);
+    state.shake = Math.min(14, state.shake + 5);
+    if (cause === 'bullet' && boat.kind === 'police') {
+      state.events.push({ kind: 'crime', crime: 'killCop', x: boat.x, y: boat.y, certain: true });
+    }
+  }
+}
+
+// Moored boats just bob; wrecks settle and are cleaned up after a while.
+// (The police boat's brain is in police.js; it calls stepBoat itself.)
+export function updateBoats(state, dt) {
+  for (const b of state.boats) {
+    if (b.kind === 'police' && !b.dead) continue; // police.js drives it
+    if (b.dead) { b.wreckT += dt; continue; }
+    if (b !== state.player.inBoat) stepBoat(state, b, { throttle: 0, steer: 0 }, dt);
+  }
+  state.boats = state.boats.filter((b) => !(b.dead && b.wreckT > 24) && !b.removeMe);
 }
 
 // Traffic: follow the avenue lanes, turn at some intersections, stop for
@@ -322,9 +443,10 @@ export function createPed(x, y, opts = {}) {
     hp: opts.hp || 40, maxHp: opts.hp || 40,
     state: 'walk', target: null, waitT: Math.random() * 2,
     hostile: !!opts.hostile, weapon: opts.weapon || null, fireT: Math.random(),
+    cop: !!opts.cop, beat: opts.beat || null,
     downT: 0, dead: false, fadeT: 0, fleeFrom: null, fleeT: 0,
-    shirt: opts.shirt || SHIRTS[Math.floor(Math.random() * SHIRTS.length)],
-    pants: PANTS[Math.floor(Math.random() * PANTS.length)],
+    shirt: opts.cop ? '#274268' : (opts.shirt || SHIRTS[Math.floor(Math.random() * SHIRTS.length)]),
+    pants: opts.cop ? '#1d2733' : PANTS[Math.floor(Math.random() * PANTS.length)],
     name: opts.name || null, cashDrop: opts.cashDrop ?? (5 + Math.floor(Math.random() * 22)),
   };
 }
@@ -338,12 +460,19 @@ export function hurtPed(state, ped, amount, fromAngle, byPlayer) {
     ped.dead = true; ped.fadeT = 25;
     dropCash(state, ped.x, ped.y, ped.cashDrop);
     if (byPlayer) {
-      state.events.push({ kind: 'crime', crime: ped.hostile ? 'gunfire' : 'killPed', x: ped.x, y: ped.y });
+      if (ped.cop) state.events.push({ kind: 'crime', crime: 'killCop', x: ped.x, y: ped.y, certain: true });
+      else state.events.push({ kind: 'crime', crime: ped.hostile ? 'gunfire' : 'killPed', x: ped.x, y: ped.y });
     }
-  } else {
+  } else if (ped.cop && byPlayer) {
+    // laying a hand on an officer is always radioed in
+    state.events.push({ kind: 'crime', crime: 'hitCop', x: ped.x, y: ped.y, certain: true });
+  }
+  if (ped.hp > 0) {
     ped.downT = Math.max(ped.downT, 1.6);
-    ped.fleeFrom = { x: ped.x - Math.cos(fromAngle) * 100, y: ped.y - Math.sin(fromAngle) * 100 };
-    ped.fleeT = 3;
+    if (!ped.cop) { // officers get back up and come for you; civilians run
+      ped.fleeFrom = { x: ped.x - Math.cos(fromAngle) * 100, y: ped.y - Math.sin(fromAngle) * 100 };
+      ped.fleeT = 3;
+    }
   }
 }
 
@@ -355,9 +484,39 @@ export function updatePeds(state, dt) {
     if (p.downT > 0) { p.downT -= dt; continue; }
     let moveA = null, speed = 0;
 
-    if (p.hostile) {
+    if (p.cop) {
+      // A beat officer: ambles around his post, but the moment there is a
+      // wanted man on foot in sight he gives chase — and if he gets an
+      // elbow on him, the bust meter (police.js) does the rest. He does
+      // not chase cars or boats; the cruisers and the patrol boat exist
+      // for that.
       const d = Math.hypot(player.x - p.x, player.y - p.y);
-      const targetD = player.inCar ? 210 : 165;
+      const hunting = state.wanted.stars > 0 && !player.inCar && !player.inBoat && d < 360;
+      if (hunting) {
+        if (d > 30) { moveA = Math.atan2(player.y - p.y, player.x - p.x); speed = 192; }
+        p.angle = angleLerp(p.angle, Math.atan2(player.y - p.y, player.x - p.x), dt * 9);
+      } else {
+        if (!p.target || Math.hypot(p.target.x - p.x, p.target.y - p.y) < 12) {
+          p.waitT -= dt;
+          if (p.waitT <= 0) {
+            p.waitT = Math.random() * 2;
+            const home = p.beat || p;
+            for (let tries = 0; tries < 8; tries++) {
+              const tx = Math.floor(home.x / TILE) + Math.floor((Math.random() - 0.5) * 10);
+              const ty = Math.floor(home.y / TILE) + Math.floor((Math.random() - 0.5) * 10);
+              if (WALKABLE.has(city.tileAt(tx, ty))) { p.target = { x: tx * TILE + 16, y: ty * TILE + 16 }; break; }
+            }
+          }
+        }
+        if (p.target && p.waitT <= 0) {
+          moveA = Math.atan2(p.target.y - p.y, p.target.x - p.x);
+          speed = 56;
+          p.angle = angleLerp(p.angle, moveA, dt * 6);
+        }
+      }
+    } else if (p.hostile) {
+      const d = Math.hypot(player.x - p.x, player.y - p.y);
+      const targetD = (player.inCar || player.inBoat) ? 210 : 165;
       if (d > targetD + 40) { moveA = Math.atan2(player.y - p.y, player.x - p.x); speed = 120; }
       else if (d < targetD - 60) { moveA = Math.atan2(p.y - player.y, p.x - player.x); speed = 95; }
       else { moveA = Math.atan2(player.y - p.y, player.x - p.x) + Math.PI / 2; speed = 42; }
@@ -398,7 +557,7 @@ export function updatePeds(state, dt) {
     }
     // threat reaction: nearby gunfire or a crash sends walkers running
     const threat = state.lastThreat;
-    if (!p.hostile && threat && state.time - threat.t < 0.4 && dist2(p.x, p.y, threat.x, threat.y) < 240 * 240) {
+    if (!p.hostile && !p.cop && threat && state.time - threat.t < 0.4 && dist2(p.x, p.y, threat.x, threat.y) < 240 * 240) {
       p.fleeFrom = { x: threat.x, y: threat.y }; p.fleeT = 2 + Math.random() * 2;
     }
   }
@@ -421,17 +580,21 @@ export function updateBullets(state, dt) {
     b.life -= dt;
     if (b.life <= 0) { b.dead = true; continue; }
     const nx = b.x + b.vx * dt, ny = b.y + b.vy * dt;
-    if (city.tileAtPx(nx, ny) === T.WATER || circleBlocked(city, nx, ny, 2)) {
+    // rounds fly OVER open water (that is where the boats live); on land
+    // they still die on anything solid
+    const overWater = city.tileAtPx(nx, ny) === T.WATER;
+    if (!overWater && circleBlocked(city, nx, ny, 2)) {
       spawnParticles(state, 'spark', nx, ny, 3);
       b.dead = true; continue;
     }
     b.x = nx; b.y = ny;
     if (b.hostile) {
-      const target = player.inCar ? state.playerCar() : player;
-      const r = player.inCar ? target.def.h + 8 : 12;
+      const target = player.inCar ? state.playerCar() : (player.inBoat || player);
+      const r = (player.inCar || player.inBoat) ? target.def.h + 8 : 12;
       if (target && dist2(b.x, b.y, target.x, target.y) < r * r) {
         b.dead = true;
         if (player.inCar) damageCar(state, target, b.damage * 0.4, 'bullet');
+        if (player.inBoat) damageBoat(state, target, b.damage * 0.4, 'bullet');
         state.damagePlayer(b.damage, Math.atan2(b.vy, b.vx));
       }
     } else {
@@ -449,6 +612,15 @@ export function updateBullets(state, dt) {
           damageCar(state, car, b.damage, 'bullet');
           spawnParticles(state, 'spark', b.x, b.y, 4);
           if (car.kind === 'police') state.events.push({ kind: 'crime', crime: 'hitCop', x: car.x, y: car.y });
+          b.dead = true; consumed = true; break;
+        }
+      }
+      if (!consumed) for (const bt of state.boats) {
+        if (bt === player.inBoat || bt.dead) continue;
+        if (dist2(b.x, b.y, bt.x, bt.y) < (bt.def.h + 7) * (bt.def.h + 7)) {
+          damageBoat(state, bt, b.damage, 'bullet');
+          spawnParticles(state, 'splash', b.x, b.y, 4);
+          if (bt.kind === 'police') state.events.push({ kind: 'crime', crime: 'hitCop', x: bt.x, y: bt.y });
           b.dead = true; break;
         }
       }
@@ -466,6 +638,7 @@ const PARTICLE_STYLE = {
   cash:    { color: '#57e389', size: 2.6, life: 0.6, grav: 60, speed: 90 },
   hitpuff: { color: '#c94f42', size: 3.4, life: 0.4, grav: 120, speed: 80 },
   splash:  { color: '#7ec3ee', size: 3, life: 0.5, grav: 260, speed: 120 },
+  wake:    { color: '#dff2fb', size: 3.6, life: 0.95, grav: 0, speed: 20 },
 };
 export function spawnParticles(state, kind, x, y, n, spread = 1) {
   const st = PARTICLE_STYLE[kind] || PARTICLE_STYLE.spark;

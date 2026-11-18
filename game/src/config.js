@@ -41,6 +41,19 @@ export const VEHICLE_TYPES = {
 };
 export const VEHICLE_KEYS = Object.keys(VEHICLE_TYPES);
 
+// ------------------------------------------------------------------ boats
+// Watercraft live on T.WATER only and steer like they mean it slowly:
+// wide turns, long slides, a wake behind. w/h are the drawn footprint.
+export const BOAT_TYPES = {
+  dinghy: { name: 'Lancha', w: 36, h: 16, topSpeed: 175, reverse: 55,
+    accel: 165, grip: 1.5, turn: 1.6, durability: 80,
+    colors: ['#e8e3d8', '#c94f42', '#4a7fc9', '#57a773'] },
+  speedboat: { name: 'Cigarrera', w: 46, h: 18, topSpeed: 305, reverse: 65,
+    accel: 275, grip: 1.9, turn: 2.0, durability: 115,
+    colors: ['#f2f2f2', '#9d0208', '#12808a', '#f4b41a'] },
+};
+export const BOAT_KEYS = Object.keys(BOAT_TYPES);
+
 // ----------------------------------------------------------------- weapons
 // damage per pellet, cooldown seconds between shots, bullet speed/range.
 export const WEAPONS = {
@@ -52,17 +65,20 @@ export const WEAPONS = {
              spread: 0.07, pellets: 1, auto: true, ammoKey: 'smg' },
   shotgun: { name: 'Escopeta', damage: 13, cooldown: 0.85, range: 240, speed: 700,
              spread: 0.16, pellets: 6, auto: false, ammoKey: 'shotgun' },
+  rifle:   { name: 'Fusil', damage: 34, cooldown: 0.16, range: 640, speed: 980,
+             spread: 0.015, pellets: 1, auto: true, ammoKey: 'rifle' },
 };
-export const WEAPON_ORDER = ['fist', 'pistol', 'smg', 'shotgun'];
+export const WEAPON_ORDER = ['fist', 'pistol', 'smg', 'shotgun', 'rifle'];
 
 // -------------------------------------------------------------------- shop
 export const PRICES = {
-  pistol: 200, smg: 850, shotgun: 600,
-  ammoPistol: 25, ammoSmg: 45, ammoShotgun: 35,   // per pack
-  ammoPack: { pistol: 24, smg: 60, shotgun: 12 }, // rounds per pack
+  pistol: 200, smg: 850, shotgun: 600, rifle: 1400,
+  ammoPistol: 25, ammoSmg: 45, ammoShotgun: 35, ammoRifle: 55, // per pack
+  ammoPack: { pistol: 24, smg: 60, shotgun: 12, rifle: 30 },    // rounds per pack
+  armor: 450, armorMax: 100,
   food: 15, healAmount: 55,
   repaint: 150, repairPerPoint: 2,
-  packageReward: 100, racePrize: 400,
+  packageReward: 100, racePrize: 400, race2Prize: 600,
 };
 
 // ------------------------------------------------------------------ wanted
@@ -73,6 +89,7 @@ export const CRIME_HEAT = {
 };
 export const STAR_THRESHOLDS = [0, 20, 60, 110, 170, 240]; // index = stars
 export const POLICE_COUNT = [0, 2, 3, 4, 6, 8];            // cruisers by stars
+export const FOOT_COPS = 5;           // uniformed officers walking beats
 export const HEAT_DECAY = 7;          // heat/second while nobody sees you
 export const BUST_TIME = 2.4;         // seconds of close contact to be busted
 

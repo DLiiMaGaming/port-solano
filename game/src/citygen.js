@@ -338,9 +338,92 @@ export function generateCity(seed) {
   const raceCheckpoints = [[2, 1], [5, 2], [8, 4], [6, 7], [3, 8], [1, 5], [4, 3], [7, 1]]
     .map(([bx, by]) => ({ x: (bx * BAND + 2) * TILE, y: (by * BAND + 2) * TILE }));
 
+  // ---- harbour boats, courier stops & the Isla Brisa race -----------------
+  // Fixed-coordinate additions placed AFTER all seeded generation above:
+  // they take no draws from the `rng` stream, so the city built so far is
+  // byte-identical to before for a given seed.
+  const boatSpots = [
+    { x: 4992, y: 7408, angle: 0, type: 'dinghy' },          // El Puerto front, bx6
+    { x: 5760, y: 7408, angle: Math.PI, type: 'speedboat' }, // bx7
+    { x: 6528, y: 7408, angle: 0, type: 'dinghy' },          // bx8
+    { x: 7296, y: 7408, angle: Math.PI, type: 'speedboat' }, // bx9
+    { x: 3360, y: 7440, angle: Math.PI, type: 'dinghy' },    // Isla Brisa north shore
+    { x: 4320, y: 7440, angle: 0, type: 'speedboat' },       // Isla Brisa north shore
+    { x: 1920, y: 7408, angle: 0, type: 'dinghy' },          // La Playa front
+  ];
+  spots.boatDock = { x: 4992, y: 229 * TILE + 16 };   // dock tile in front of the first harbour boat
+  spots.islandDock = { x: 4320, y: 233 * TILE + 16 }; // island grass at the north shore
+  const courierSpots = [
+    { name: 'Terminal de Buses', x: terminalB.door.x, y: terminalB.door.y + 10 },
+    { name: 'Hotel Mirador', x: hotelB.door.x, y: hotelB.door.y + 10 },
+    { name: 'Plaza Mayor', x: spots.plaza.x, y: spots.plaza.y },
+    { name: 'Almacén Brisa', x: brisaB.door.x, y: brisaB.door.y + 10 },
+    { name: 'Comisaría Central', x: policeStation.door.x, y: policeStation.door.y + 10 },
+    { name: 'La Playa', x: taxiStands[3].x, y: taxiStands[3].y },
+  ];
+  const race2Start = { x: (7 * BAND + 2) * TILE, y: (8 * BAND + 2) * TILE };
+  const islaCheckpoints = [
+    { x: 3904, y: 6208 }, // harbour avenue
+    { x: 3136, y: 6976 }, // causeway north
+    { x: 3104, y: 7584 }, // island SW (causeway bridge)
+    // (3872, 7584) as first specified lands on WATER: the island avenue
+    // band tx 120-123 is never carved (only the tx 96-99 causeway becomes
+    // BRIDGE), so this uses the nearest SAND tile instead, (118, 238).
+    { x: 3776, y: 7616 }, // island SE (south-row sand)
+    { x: 3872, y: 6976 }, // NE avenue
+    { x: 5440, y: 6208 }, // finish at race2Start
+  ];
+
+  // ---- visual-density props (decorative, NON-solid) ------------------------
+  // A separate pass with its OWN rng (seed ^ 0x9e3779b9): it only appends to
+  // `props`, never touches `solids`, and cannot perturb the main rng stream.
+  const rng2 = new RNG(seed ^ 0x9e3779b9);
+  const doorPts = [];
+  for (const b of buildings) doorPts.push(b.door);
+  for (const s of shops) doorPts.push(s.door);
+  const nearDoor = (x, y) => doorPts.some((d) => Math.hypot(d.x - x, d.y - y) < 40);
+  const usedPropTiles = new Set();
+  const scatterProps = (kind, cap, isCandidate, withHue) => {
+    const candidates = [];
+    for (let ty = 0; ty < N; ty++) {
+      for (let tx = 0; tx < N; tx++) {
+        if (isCandidate(get(tx, ty), tx, ty)) candidates.push([tx, ty]);
+      }
+    }
+    // Shuffle with rng2 so capped props spread over the whole map instead
+    // of clustering in the first rows the scan reaches.
+    for (let i = candidates.length - 1; i > 0; i--) {
+      const j = rng2.int(0, i);
+      const tmp = candidates[i]; candidates[i] = candidates[j]; candidates[j] = tmp;
+    }
+    let placed = 0;
+    for (const [tx, ty] of candidates) {
+      if (placed >= cap) break;
+      const key = tx + ',' + ty;
+      if (usedPropTiles.has(key)) continue;
+      const cx = tx * TILE + TILE / 2, cy = ty * TILE + TILE / 2;
+      if (nearDoor(cx, cy)) continue;
+      if (!rng2.chance(0.65)) continue;
+      const prop = { kind, x: cx + rng2.range(-6, 6), y: cy + rng2.range(-6, 6) };
+      if (withHue) prop.hue = rng2.int(0, 3);
+      props.push(prop);
+      usedPropTiles.add(key);
+      placed++;
+    }
+  };
+  const blockDistrict = (tx, ty) => districtOfBlock(
+    Math.min(9, Math.floor(tx / BAND)), Math.min(9, Math.floor(ty / BAND)));
+  scatterProps('umbrella', 14, (t) => t === T.SAND, true);
+  scatterProps('towel', 16, (t) => t === T.SAND, false);
+  scatterProps('stall', 6, (t, tx, ty) => t === T.SIDEWALK && blockDistrict(tx, ty) === 'playa', false);
+  scatterProps('dumpster', 22, (t, tx, ty) => t === T.SIDEWALK && (blockDistrict(tx, ty) === 'down' || blockDistrict(tx, ty) === 'ind'), false);
+  scatterProps('barrel', 20, (t) => t === T.DOCK, true);
+  scatterProps('bench', 14, (t) => t === T.PARK || t === T.PLAZA, false);
+
   const city = {
     seed, tiles, buildings, solids, props, lamps, shops, packages, parkedSpots,
     lanesH, lanesV, intersections, taxiStands, spots, raceStart, raceCheckpoints,
+    boatSpots, courierSpots, race2Start, islaCheckpoints,
     safehouse: { x: safehouseB.x + safehouseB.w / 2, y: safehouseB.y + safehouseB.h / 2, door: safehouseB.door },
     hospital: { x: hospital.x + hospital.w / 2, y: hospital.y + hospital.h / 2, door: hospital.door },
     policeStation: { x: policeStation.x + policeStation.w / 2, y: policeStation.y + policeStation.h / 2, door: policeStation.door },

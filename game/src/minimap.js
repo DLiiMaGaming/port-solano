@@ -141,6 +141,22 @@ export function createMinimap(city) {
       if (c.kind !== 'police' && c.kind !== 'cruiser') continue;
       dot(ctx, ix + c.x * scale, iy + c.y * scale, 3, copFill);
     }
+    // Boats: moored hulls are pale dots; the patrol boat flashes like a
+    // cruiser; the helicopter is a white dot with a wide, thin ring.
+    const boats = state.boats || [];
+    for (let i = 0; i < boats.length; i++) {
+      const b = boats[i];
+      if (b.dead) continue;
+      if (b.kind === 'police') dot(ctx, ix + b.x * scale, iy + b.y * scale, 3, copFill);
+      else dot(ctx, ix + b.x * scale, iy + b.y * scale, 2, 'rgba(220,242,251,0.8)');
+    }
+    if (state.heli) {
+      const hx = ix + state.heli.x * scale, hy = iy + state.heli.y * scale;
+      ctx.strokeStyle = 'rgba(255,244,190,0.65)';
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.arc(hx, hy, 6.5, 0, Math.PI * 2); ctx.stroke();
+      dot(ctx, hx, hy, 2.4, '#ffffff');
+    }
     // Taxi: cyan pickup, green destination.
     if (state.taxi) {
       if (state.taxi.pickup) {
@@ -156,6 +172,11 @@ export function createMinimap(city) {
     if (state.race) {
       const cp = state.race.checkpoints[state.race.next];
       if (cp) diamond(ctx, ix + cp.x * scale, iy + cp.y * scale, 5, '#ff2fd6');
+    }
+    // Courier: the delivery point burns orange.
+    if (state.courier && state.courier.active && state.courier.dest) {
+      diamond(ctx, ix + state.courier.dest.x * scale,
+        iy + state.courier.dest.y * scale, 5, '#ff8c42');
     }
     // Mission marker: gold pulsing diamond on top of other blips.
     if (state.mission && state.mission.marker) {
