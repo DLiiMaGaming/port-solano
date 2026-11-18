@@ -1,2 +1,13 @@
+# Build output (main.ts delivery) and dependencies
 out/
 node_modules/
+
+# Local delivery variants from by-hand main.ts runs
+out-*/
+tmp-out/
+
+# Logs, OS noise and editor scratch
+*.log
+.DS_Store
+*.swp
+*~

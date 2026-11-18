@@ -29,7 +29,18 @@ const MIME_TYPES: Record<string, string> = {
   '.wasm': 'application/wasm',
 };
 
-createServer((request, response) => {
+// Caching for a dev server: the HTML shell is revalidated on every load
+// (no-cache) so a fresh edit is never masked by a stale page, while the
+// assets under it get a short cache — long enough to skip refetching
+// every module on each reload, short enough that edits land within a
+// minute.
+function cacheControlFor(filePath: string): string {
+  return extname(filePath).toLowerCase() === '.html'
+    ? 'no-cache'
+    : 'public, max-age=60';
+}
+
+const server = createServer((request, response) => {
   const url = new URL(request.url ?? '/', 'http://localhost');
   let pathname: string;
   try {
@@ -56,9 +67,21 @@ createServer((request, response) => {
   response.writeHead(200, {
     'content-type': MIME_TYPES[extname(filePath).toLowerCase()] ?? 'application/octet-stream',
     'content-length': size,
-    'cache-control': 'no-store',
+    'cache-control': cacheControlFor(filePath),
   });
   createReadStream(filePath).pipe(response);
-}).listen(port, '127.0.0.1', () => {
-  console.log(`PORT SOLANO game/ is live at http://localhost:${port}`);
+});
+
+server.on('error', (err: NodeJS.ErrnoException) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`PORT SOLANO — port ${port} is already in use (another server is probably running).`);
+    console.error(`Stop that one, or start this game on a free port: node serve.ts --port ${port + 1}`);
+  } else {
+    console.error(`PORT SOLANO — the server could not start: ${err.message}`);
+  }
+  process.exit(1);
+});
+
+server.listen(port, '127.0.0.1', () => {
+  console.log(`PORT SOLANO — game/ is live at http://localhost:${port}/ — open it in a desktop browser (Ctrl+C to stop)`);
 });
