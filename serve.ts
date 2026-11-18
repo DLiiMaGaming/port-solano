@@ -1,20 +1,19 @@
-// PORT SOLANO — a tiny local server for playing the game during
-// development. `node serve.ts` serves game/ at http://localhost:8902
-// (pass --port N for another port). Standard library only; it refuses
-// paths outside game/ and exists purely as a development convenience.
-
+// A tiny static server for game/ (Node 22, standard library only), so an entry can be played
+// locally without a build step: `node serve.ts` serves game/ on http://localhost:8080.
+// It sends the MIME types a browser game needs, refuses any path outside game/, and otherwise
+// does nothing clever: this is a development convenience, not a web server for the internet.
 import { createReadStream, statSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { extname, join, normalize, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const gameRoot = resolve(fileURLToPath(new URL('./game', import.meta.url)));
+const root = resolve(fileURLToPath(new URL('./game', import.meta.url)));
 const args = process.argv.slice(2);
-const portFlag = args.indexOf('--port');
-const wanted = portFlag === -1 ? 8902 : Number(args[portFlag + 1]);
-const port = Number.isInteger(wanted) && wanted > 0 && wanted < 65536 ? wanted : 8902;
+const portIndex = args.indexOf('--port');
+const requested = portIndex === -1 ? 8080 : Number(args[portIndex + 1]);
+const port = Number.isInteger(requested) && requested > 0 && requested < 65536 ? requested : 8080;
 
-const MIME_TYPES: Record<string, string> = {
+const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
   '.mjs': 'text/javascript; charset=utf-8',
@@ -23,22 +22,20 @@ const MIME_TYPES: Record<string, string> = {
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
   '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
   '.svg': 'image/svg+xml',
   '.ico': 'image/x-icon',
   '.woff2': 'font/woff2',
+  '.glb': 'model/gltf-binary',
+  '.gltf': 'model/gltf+json',
+  '.bin': 'application/octet-stream',
   '.wasm': 'application/wasm',
+  '.wav': 'audio/wav',
+  '.mp3': 'audio/mpeg',
+  '.ogg': 'audio/ogg',
+  '.txt': 'text/plain; charset=utf-8',
 };
-
-// Caching for a dev server: the HTML shell is revalidated on every load
-// (no-cache) so a fresh edit is never masked by a stale page, while the
-// assets under it get a short cache — long enough to skip refetching
-// every module on each reload, short enough that edits land within a
-// minute.
-function cacheControlFor(filePath: string): string {
-  return extname(filePath).toLowerCase() === '.html'
-    ? 'no-cache'
-    : 'public, max-age=60';
-}
 
 const server = createServer((request, response) => {
   const url = new URL(request.url ?? '/', 'http://localhost');
@@ -50,14 +47,14 @@ const server = createServer((request, response) => {
     return;
   }
   if (pathname.endsWith('/')) pathname += 'index.html';
-  const filePath = resolve(join(gameRoot, normalize(pathname)));
-  if (filePath !== gameRoot && !filePath.startsWith(gameRoot + sep)) {
+  const file = resolve(join(root, normalize(pathname)));
+  if (file !== root && !file.startsWith(root + sep)) {
     response.writeHead(403).end('forbidden');
     return;
   }
   let size: number;
   try {
-    const stats = statSync(filePath);
+    const stats = statSync(file);
     if (!stats.isFile()) throw new Error('not a file');
     size = stats.size;
   } catch {
@@ -65,23 +62,22 @@ const server = createServer((request, response) => {
     return;
   }
   response.writeHead(200, {
-    'content-type': MIME_TYPES[extname(filePath).toLowerCase()] ?? 'application/octet-stream',
+    'content-type': MIME[extname(file).toLowerCase()] ?? 'application/octet-stream',
     'content-length': size,
-    'cache-control': cacheControlFor(filePath),
+    'cache-control': 'no-store',
   });
-  createReadStream(filePath).pipe(response);
+  createReadStream(file).pipe(response);
 });
 
 server.on('error', (err: NodeJS.ErrnoException) => {
   if (err.code === 'EADDRINUSE') {
-    console.error(`PORT SOLANO — port ${port} is already in use (another server is probably running).`);
-    console.error(`Stop that one, or start this game on a free port: node serve.ts --port ${port + 1}`);
-  } else {
-    console.error(`PORT SOLANO — the server could not start: ${err.message}`);
+    console.error(`Port ${port} is already taken — something else is serving there.`);
+    console.error(`Stop it, or pick another port: node serve.ts --port ${port + 1}`);
+    process.exit(1);
   }
-  process.exit(1);
+  throw err;
 });
 
 server.listen(port, '127.0.0.1', () => {
-  console.log(`PORT SOLANO — game/ is live at http://localhost:${port}/ — open it in a desktop browser (Ctrl+C to stop)`);
+  console.log(`PORT SOLANO: game/ is on http://localhost:${port}`);
 });

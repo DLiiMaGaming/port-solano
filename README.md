@@ -1,84 +1,170 @@
-[![make.fun · gta6-01](https://make.fun/badge/gta6-01.svg)](https://make.fun/bounty/gta6-01?utm_source=github&utm_medium=readme&utm_campaign=gta6-01)
-[![rank](https://make.fun/badge/gta6-01/DLiiMaGaming/port-solano/rank.svg)](https://make.fun/bounty/gta6-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=gta6-01)
-[![reward](https://make.fun/badge/gta6-01/DLiiMaGaming/port-solano/reward.svg)](https://make.fun/bounty/gta6-01?utm_source=github&utm_medium=readme&utm_campaign=gta6-01)
+[![make.fun gta6-01](https://make.fun/badge/gta6-01.svg)](https://make.fun/c/gta6-01)
+[![rank](https://make.fun/badge/gta6-01/DLiiMaGaming/port-solano/rank.svg)](https://make.fun/c/gta6-01)
+[![reward](https://make.fun/badge/gta6-01/DLiiMaGaming/port-solano/reward.svg)](https://make.fun/c/gta6-01)
 
 # PORT SOLANO
 
-**An original open-world crime game that runs entirely in a desktop browser.** One self-contained static site — no build step, no network requests, no external assets. Every sprite is drawn in code on a 2D canvas; every sound is synthesized live with WebAudio.
+An original top-down 2D open-world crime game in the spirit of GTA 6, built for the
+[make.fun gta6-01](https://make.fun/c/gta6-01) bounty. One coastal city, one island, one
+crime boss — and you, a nobody with a borrowed name, working your way up Marisol Vega's
+ladder until the bay answers to you.
 
-You step off the bus at the Terminal with $25 and family in town: your cousin Darío has a room, and your tía Marisol Vega has work — the kind that pays in cash. Across six districts and one island, her crew is squeezing out the dock boss El Pulpo. Steal cars, take a boat across the bay, run the crew's errands, dodge La Patrulla on road, on foot and on the water, and settle the bay's accounts — or just live in the city: run taxi fares and courier packages, race two checkpoint circuits, find the 20 hidden packages, and watch the rain roll in over the water.
-
-## The city
-
-A 240×240-tile city (7,680×7,680 px) generated deterministically from a single seed — the same seed always builds the same city, street for street — with 299 named buildings, ~1,200 props, 52 parked cars and 20 hidden packages:
-
-- **Barrio Viejo** — the old town: tight blocks, the Plaza Mayor, market stalls
-- **Centro** — downtown towers, the *Terminal de Buses*, *Hospital San Solano*, the *Comisaría Central*
-- **Zona Industrial** — warehouses, yards and dumpster alleys east of the avenues
-- **Las Colinas** — quiet suburbs; *Casa de Darío*, your safehouse
-- **La Playa** — beachfront hotels, food stands, umbrellas and towels on the sand
-- **El Puerto** — the working harbour: docks, cranes, crates and barrels
-- **Isla Brisa** — a little island in the bay, reached by a single bridge — or by boat
-
-Rooftops wear their clutter: AC units with fan discs, vent stacks, water towers, parapets and bright signs over the shops. The bay is alive too — dinghies and speedboats ride at the docks and the island shore.
-
-## What's in the game
-
-- **On foot, by car, by boat** — WASD movement with mouse aim and sprint; any parked or moving car can be taken (six vehicle types — compact, sedan, muscle, pickup, taxi, police cruiser — with distinct speed, grip, durability and looks). At the water's edge, press `E` to board a moored dinghy or speedboat: wide, sliding turns, a foam wake, and you can shoot from the deck. Step ashore again wherever the hull reaches land.
-- **Traffic and pedestrians** — lane-following traffic that brakes, honks, panics and flees; pedestrians who stroll, run from gunfire and drop cash when knocked down.
-- **Wanted system** — crimes only count when witnessed. 1–5 stars bring cruisers that chase and ram; from 3 stars they shoot; at 5 they set roadblocks ahead of you. Lose them and the heat decays. Stay close to a stopped officer long enough and the bust meter fills.
-- **Foot patrols** — uniformed officers walk beats at the Comisaría, the plaza, the customs dock, the hotel and the terminal. They witness crimes, chase you on foot, and their hands fill the same bust meter.
-- **The helicopter** — at five stars a Patrulla helicopter shadows you on a slow orbit, pins a spotlight circle on the ground around you (you cannot hide from it), and fires bursts. Drop below five stars and it climbs away.
-- **The harbour patrol** — take to the water at three stars or more and a police speedboat answers in kind: it runs you down across the bay and shoots like a cruiser. Step back onto land and it gives up.
-- **Combat and armour** — fists, pistol, SMG, shotgun and the long-range automatic **Fusil** rifle, with an ammo economy at **Armas Solano** — which also sells a *chaleco antibalas*: body armour with its own HUD bar that absorbs damage before your health does.
-- **A nine-mission story** — Marisol Vega, cousin Darío and dock boss El Pulpo: a welcome drive, a car theft for the chop dock, a timed crate delivery, a dock shootout, a hot pickup and escape, a checkpoint run, a night boat delivery to Isla Brisa, an island raid to clear El Pulpo's crew and sink his speedboat, and a finale that settles everything. Dialogue scenes, world and minimap markers, cash rewards — completable end to end.
-- **Side work** — taxi fares in any taxi; **courier deliveries** (pick up a package at the terminal, hotel, plaza, warehouse, Comisaría or beach stand and beat the clock across the city — pay scales with distance, leftovers of the clock come back as a speed bonus); two checkpoint races, the **Harbour Run** and the bridge-and-island **Isla Loop**; 20 hidden packages with a counter and a completion bonus.
-- **Economy and shops** — the gun shop, food stands that heal, and **Solano Customs**: repaint your car (a fresh colour throws off the heat) and repair it. The safehouse saves the game and heals you.
-- **Consequences** — get dropped and you wash up at Hospital San Solano minus a fee (or ashore, if your boat dies under you); get busted and you walk out of the Comisaría minus a fine. Wanted cleared either way.
-- **Radio** — three synthesized stations while you drive or sail: **Bajo Profundo** (sub-bass and minor keys), **Radio Bahía** (the latin-tinged house loop) and **Marea Chill** (slow pads, no drums). `R` or `]` tunes up, `[` tunes down; the station name rides the HUD.
-- **Weather** — every few minutes a rain band rolls in off the bay: streaking rain, a darker blue grade, wet sheen on the asphalt, and the soft wash of rain in the mix. Then it blows over and the streets dry.
-- **HUD and minimap** — cash, health and armour bars, wanted stars, weapon and ammo, radio station, in-game clock, mission banners and an objective line, and a live minimap with roads, your arrow, police car/boat blips, the helicopter's ring, mission/taxi/race/courier markers, shops and the safehouse.
-- **Day and night** — a full clock with dawn/dusk tinting, streetlight glow, headlights after dark — and the helicopter's spotlight burning through it.
-- **Polish** — handbrake drifts with fading skid marks and tyre smoke, collision damage with engine smoke, wakes and splashes, muzzle flashes, sparks, screen shake, floating cash text, district name cards when you cross a border.
-- **Sound, all synthesized** — engine hum tied to speed (at the wheel or the helm), police sirens that swell as they close in, rain noise, per-weapon gunshots, punches, horns, pickup blips, a mission-complete jingle and the three radio loops. `M` mutes.
-
-## Controls
-
-| Key | Action |
-| --- | --- |
-| `W A S D` / arrows | Move · drive · sail |
-| Mouse | Aim · click to attack or shoot |
-| `Shift` | Sprint (on foot) |
-| `Space` | Handbrake (in a car) |
-| `E` | Enter / exit car or boat · talk · use a shop · pick up a courier package · save at the safehouse |
-| `1`–`5` | Fists / pistol / SMG / shotgun / rifle |
-| `R` / `]` | Radio: next station |
-| `[` | Radio: previous station |
-| `Esc` / `P` | Pause |
-| `M` | Mute |
-
-## How it maps to the brief
-
-The gta6-01 brief asks for an original, browser-playable open-world crime game in the spirit of the genre's classics. PORT SOLANO answers it system for system: a full city with districts and landmarks; free-roam on foot, in cars and in boats; a wanted system with ground, foot, water and air response; a chained story campaign with named characters and dialogue; side jobs and races for the hours between missions; shops, an economy and save/continue; and a day/night, weather and radio layer that makes the city feel lived-in. It is 100% original — every name, line of dialogue, street and note of music was made for this entry — and 100% self-contained: vanilla JS ES modules, canvas rendering, WebAudio synthesis, no assets, no network, no build step.
+Everything is original: the city of Puerto Solano, its people (Marisol Vega, Darío, the
+boss they call El Pulpo), its radio stations and its crimes. No third-party assets, no
+libraries, no network requests — the whole game is hand-written vanilla JavaScript on a
+`<canvas>`, and every sound is synthesized live with WebAudio. It plays offline in a
+desktop browser straight from `game/index.html`.
 
 ## Play it
 
-Open `game/index.html` in a desktop browser — that's the whole game. For local development, `node serve.ts` serves it at <http://localhost:8902>.
+```sh
+node serve.ts          # then open http://localhost:8080
+```
 
-Progress (cash, story, position, packages, weapons, armour, your current car or boat) saves to `localStorage`; **Continue** on the title screen picks up where you left off — saves from earlier versions load with sensible defaults. Saving at the safehouse also fully heals you.
+— or just open `game/index.html` in desktop Chrome. Keyboard + mouse, or a gamepad.
 
-## Screenshots
+## The city
 
-Four scenes are scripted for capture in `shots.json` (`game/?shot=start|drive|chase|docks&seed=7`): the title screen over the bay at golden hour, driving a Centro avenue in traffic, a three-star harbour chase, and the shootout at Almacén Pulpo. The scenes drive the real game with scripted input — no mock-ups.
+Puerto Solano is generated deterministically from seed `20261124`: a 240×240-tile
+(7,680×7,680 px) coastal city that is identical on every load.
 
-## Layout
+- **Six districts plus an island** — Barrio Viejo, Centro, Zona Industrial, Las Colinas,
+  La Playa and El Puerto on the mainland; Isla Brisa across a causeway bridge, with its
+  own streets, palms and secrets.
+- **378 named buildings** with street frontages, doorways, window rows that light up at
+  night, awnings, and rooftop props (AC units, water towers) — every one placed by the
+  generator along real street frontages, never floating in a block.
+- **1,000+ props**: street lamps with light pools after dark, palms, market stalls,
+  benches, beach umbrellas, crates, barrels and dumpsters — the solid ones are real
+  cover in a firefight.
+- **Functional locations**: Armas Solano (gun shop), Solano Customs (repaint + repair),
+  Casa de Darío (safehouse: save and heal), Hospital San Solano (where the dead wake
+  up, minus a bill), Comisaría Central (police HQ), taxi stands, two race starts,
+  courier spots, and docks with moored boats around the bay and the island.
+- **20 hidden packages** scattered over rooftops' edges, alleys, piers and the island.
+- **Living street life**: lane-driving traffic that stops, swerves and occasionally
+  piles up; pedestrians who stroll, wait, and flee from gunfire; parked cars waiting
+  to be borrowed.
+- **A full day/night cycle** (dawn gold, noon glare, dusk amber, lit windows and lamp
+  pools at night) and **rain bands** that roll in off the bay, slick the streets and
+  hiss on the radio.
 
-- `game/index.html` — page shell, HUD, menus; loads `game/src/main.js`
-- `game/src/` — the game in focused ES modules: `config`, `random`, `input`, `audio`, `citygen`, `entities`, `police`, `missions`, `render`, `minimap`, `shots`, `main`
-- `main.ts` — the delivery program: copies `game/` and `screenshots/` to the output directory and writes `dossier.json` with the vendored library
-- `serve.ts` — the local development server
-- `vendor/makefun-game.ts` — the competition kit's library, byte-identical
+## Systems
+
+- **On foot**: run, sprint, fight with fists or four firearms — pistol, SMG, shotgun
+  and rifle — each with its own spread, cadence, pellet pattern and tracer; a separate
+  armor pool absorbs 75% of incoming damage until it is gone.
+- **Six car types** with distinct handling, top speed, armor and silhouettes: compact,
+  sedan, muscle, pickup, taxi and police cruiser — headlight cones at night, a lit
+  TAXI sign, flashing cruiser light bars, skid marks, exhaust smoke, crash damage.
+- **Car theft**: any parked or stopped car can be taken; the owner may have opinions.
+- **Boats**: dinghies and speedboats moored at the docks and the island, with wake
+  physics and shore-based boarding — step off a pier onto a deck, step back onto land.
+- **Wanted system, 1–5 stars**: cruisers pursue and ram; from 3 stars officers shoot
+  on sight and a police boat joins on the water; at 5 stars roadblocks seal the
+  avenues and a helicopter hunts you with a spotlight and a door gunner. Foot-patrol
+  officers walk beats all over the city — if one reaches you with a full bust meter,
+  you are arrested. Die instead and the hospital sends the bill. Either way, a mission
+  in progress fails and can be retried at its marker.
+- **Work**: drive a Taxi Solano cab and take fares; run two checkpoint races (Harbour
+  Run on the mainland, Isla Loop over the bridge and around the island); take timed
+  courier deliveries that pay by distance and punctuality.
+- **Shops**: Armas Solano sells weapons, ammo and armor; Solano Customs repaints and
+  repairs whatever you are driving — including a stolen cruiser, no questions asked.
+- **Radio**: three fully synthesized stations while you drive — Bajo Profundo (bass
+  and drums), Radio Bahía (the default: warm chords and a lead line) and Marea Chill
+  (slow pads) — plus synthesized engine, gunfire, sirens, rain and UI sounds. No audio
+  files anywhere.
+- **Save / continue**: the safehouse (or the title screen's Continue) persists cash,
+  story progress, weapons, armor, packages and your current ride in `localStorage`.
+- **Minimap**: a live 96-tile window with the player, mission markers, police,
+  contacts, taxi pickups and hostile blips.
+
+## Story
+
+Nine missions, one arc. Marisol Vega runs the bay's errands; Darío owes the wrong man;
+El Pulpo owns the warehouse, the island, and — he believes — everyone in them.
+
+1. **Llegada** — arrive broke, meet Marisol, get introduced to Darío. ($40)
+2. **El Recado** — a driving/collection job under a timer, with the bay watching. ($300)
+3. **Almacén Pulpo** — a warehouse shootout over El Pulpo's account books. ($450)
+4. **Persecución** — heat, a chase, and losing the police the hard way. ($500)
+5. **El Taxi** — a cover job: drive Marisol's people in a cab, no questions. ($600)
+6. **La Redada** — a raid on the customs yard. ($700)
+7. **Marea Nocturna** — a night boat delivery to Isla Brisa. ($850)
+8. **La Isla del Pulpo** — clear the island crew and sink El Pulpo's marked speedboat. ($1,200)
+9. **El Último Amanecer** — the finale, at dawn, back where it started. ($1,600)
+
+Every mission has full intro and outro dialogue, and the objectives mix go-to,
+collection, timed runs, shootouts, an escape, a taxi cover, a boat run and a sinking.
+
+## Controls
+
+| Action | Keyboard / mouse | Gamepad |
+| --- | --- | --- |
+| Move / drive | WASD or arrow keys | Left stick |
+| Aim | Mouse | Right stick |
+| Fire / attack | Left mouse button | Right trigger (RT) |
+| Sprint | Shift | Left stick click / LB |
+| Interact / enter / exit vehicle | E | A (cross) |
+| Handbrake | Space | B (circle) |
+| Weapon slots 1–5 | 1 2 3 4 5 | D-pad left / right |
+| Radio next / previous station | R / F | Y (triangle) / X (square) |
+| Pause / resume | Esc or P | Start |
+| Mute | M | — |
+| Confirm (menus, dialogue) | Enter, Space or E | A (cross) |
+
+On the title screen: **N** starts a new game, **C** continues a saved one.
+
+## How it maps to the brief
+
+- **A city to explore on foot and by car** — a 240×240-tile seeded city, six districts
+  and an island, 378 named buildings, functional shops and services, hidden packages.
+- **Traffic and pedestrians** — lane-following traffic AI with yielding and crash
+  reactions; pedestrians with walk cycles, clothing colors and flight responses.
+- **Cars to steal and drive** — six types with distinct handling; any car can be taken.
+- **A wanted level and police who respond** — 1–5 stars with pursuing cruisers, shots
+  from 3 stars, roadblocks and a helicopter at 5, a police boat on water, foot patrols
+  who bust, arrest and hospital respawns, and heat that decays only out of sight.
+- **Missions and a story** — a nine-mission arc with dialogue, varied objective types,
+  escalating rewards, failure and retry; plus repeatable taxi, race and courier work.
+- **Combat** — fists and four firearms, armor, hostile crews with cover-seeking
+  movement, muzzle flashes, tracers, blood and smoke.
+- **A HUD with a minimap** — cash, clock, district, wanted stars, bust meter, health
+  and armor bars, weapon and ammo, radio station, objective line, live minimap.
+- **A start screen and a way to save** — title menu with New Game / Continue, pause
+  menu, game-over flow, and safehouse saves persisted in `localStorage`.
+- **Polish** — day/night cycle with a golden-hour grade and vignette, animated water
+  with shore foam, rain, headlight cones and lamp pools, skid marks, a three-station
+  synthesized radio and a fully synthesized soundscape. Screenshots are staged by the
+  game's own `shots.js` scenes (see `shots.json`), never edited.
+
+## Structure
+
+```
+main.ts                  delivery program: copies game/ + screenshots/ to the output
+                         directory and writes dossier.json via vendor/makefun-game.ts
+serve.ts                 local dev server for game/ (cache headers, friendly errors)
+shots.json               the five scripted screenshot scenes
+game/index.html          shell, HUD and menus
+game/src/config.js       tunables: world size, weapons, vehicles, prices, caps
+game/src/random.js       seeded RNG + shuffle / pick / pickWeighted helpers
+game/src/citygen.js      deterministic city generation and spatial queries
+game/src/entities.js     player, cars, boats, pedestrians, combat, traffic
+game/src/police.js       wanted levels, cruisers, roadblocks, helicopter, patrols
+game/src/missions.js     the 9-mission story, taxi fares, races, courier job
+game/src/audio.js        WebAudio synth engine: SFX, engines, sirens, 3 radio stations
+game/src/input.js        keyboard + mouse + gamepad, normalized to one input object
+game/src/render.js       the canvas renderer: city, entities, weather, lighting, HUD art
+game/src/minimap.js      the minimap: prerendered city, live blips
+game/src/shots.js        screenshot scene staging (used by shots.json)
+game/src/main.js         game state, the fixed-step loop, shops, saves, boot
+```
+
+The simulation runs on a fixed 60 Hz step decoupled from rendering, with entity caps
+and view culling throughout — the same modules run headless under Node for testing,
+which is how the story's end-to-end completability was verified.
 
 ## License
 
-MIT — see `LICENSE`. Port Solano, its city, characters and story are original works created for this entry.
+MIT — see [LICENSE](LICENSE).
